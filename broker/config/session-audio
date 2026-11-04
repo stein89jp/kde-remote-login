@@ -1,0 +1,351 @@
+#!/usr/bin/python3
+"""Private PipeWire graph and a reconnectable, bounded S16LE monitor socket."""
+from collections import deque
+import os
+from pathlib import Path
+import selectors
+import signal
+import socket
+import subprocess
+import struct
+import ctypes
+import time
+
+
+BLOCK_BYTES = 3840  # 20 ms of stereo S16LE at 48 kHz
+CAPTURE_MAGIC = b"NRA1"
+CAPTURE_HEADER = struct.Struct("!4sIQQQ")
+CAPTURE_BUDGET_NS = 60_000_000
+GRAPH_ATTEMPTS = 3
+# A graph that ran this long before failing was healthy; its failure starts a
+# fresh attempt budget. Rapid failures still exhaust GRAPH_ATTEMPTS.
+GRAPH_HEALTHY_SECONDS = 600
+SUPERVISOR_PID = os.getpid()
+
+
+
+def relay_capture(connection, source, healthy=lambda: True):
+    """Versioned PCM, with age from the earliest observable monitor read.
+
+    Age includes this relay and Unix-socket residence, not application/PipeWire
+    buffering before the monitor read. Finish a partly sent frame to preserve
+    framing; the frontend will discard it if its source age exceeds 60 ms.
+    """
+    connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BLOCK_BYTES * 3)
+    connection.setblocking(False)
+    os.set_blocking(source.fileno(), False)
+    partial = bytearray()
+    partial_at = None
+    queued = deque()
+    offset = 0
+    frame = None
+    sequence = 0
+    with selectors.DefaultSelector() as selector:
+        selector.register(source, selectors.EVENT_READ)
+        selector.register(connection, selectors.EVENT_READ)
+        while healthy():
+            now = time.monotonic_ns()
+            while queued and not offset and now - queued[0][1] > CAPTURE_BUDGET_NS:
+                queued.popleft()
+                frame = None
+            selector.modify(connection, selectors.EVENT_READ |
+                            (selectors.EVENT_WRITE if queued else 0))
+            timeout = 0.5
+            if queued and not offset:
+                timeout = min(timeout, max(0, (queued[0][1] + CAPTURE_BUDGET_NS - now) / 1e9))
+            events = selector.select(timeout=timeout)
+            ready = {key.fileobj: mask for key, mask in events}
+            if ready.get(connection, 0) & selectors.EVENT_READ:
+                try:
+                    if not connection.recv(1):
+                        return
+                    # Frontend sends only the initial versioned readiness word.
+                    raise OSError("unexpected private audio control data")
+                except BlockingIOError:
+                    pass
+            if ready.get(source, 0) & selectors.EVENT_READ:
+                for _ in range(64):
+                    try:
+                        data = os.read(source.fileno(), BLOCK_BYTES * 16)
+                    except BlockingIOError:
+                        break
+                    if not data:
+                        return
+                    observed_at = time.monotonic_ns()
+                    if not partial:
+                        partial_at = observed_at
+                    partial.extend(data)
+                    complete = len(partial) // BLOCK_BYTES
+                    if complete:
+                        for position in range(complete):
+                            age = partial_at if position == 0 else observed_at
+                            queued.append((bytes(partial[position * BLOCK_BYTES:(position + 1) * BLOCK_BYTES]), age, sequence))
+                            sequence = (sequence + 1) & ((1 << 64) - 1)
+                            if len(queued) > 3:
+                                if offset:
+                                    del queued[1]
+                                else:
+                                    queued.popleft()
+                                    frame = None
+                        del partial[:complete * BLOCK_BYTES]
+                        partial_at = observed_at if partial else None
+            now = time.monotonic_ns()
+            while queued and not offset and now - queued[0][1] > CAPTURE_BUDGET_NS:
+                queued.popleft()
+                frame = None
+            if queued:
+                if frame is None:
+                    data, source_at, number = queued[0]
+                    frame = CAPTURE_HEADER.pack(CAPTURE_MAGIC, BLOCK_BYTES, number,
+                                                source_at, time.monotonic_ns()) + data
+                try:
+                    sent = connection.send(frame[offset:])
+                except BlockingIOError:
+                    continue
+                if sent == 0:
+                    return
+                offset += sent
+                if offset == len(frame):
+                    queued.popleft()
+                    offset = 0
+                    frame = None
+
+
+def descendant_setup():
+    # Each daemon gets its own process group for bounded descendant teardown.
+    # Parent death also terminates it when the disposable helper is SIGKILLed.
+    parent = SUPERVISOR_PID
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() != parent:
+        os._exit(125)
+
+
+def stop_process(process):
+    # Descendants can outlive their leader. Address the owned process group
+    # even when poll() reports the leader has already exited.
+    if isinstance(process.pid, int):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    elif process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        if isinstance(process.pid, int):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+        process.wait()
+    finally:
+        if isinstance(process.pid, int):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def capture(connection, environment, processes=()):
+    healthy = lambda: all(process.poll() is None for process in processes)
+    # Version negotiation is explicit; older raw helpers cannot feed metadata
+    # to the PCM codec. Keep pre-negotiation waits finite and monitor graph exit.
+    connection.settimeout(0.5)
+    ready = bytearray()
+    deadline = time.monotonic() + 120
+    try:
+        while len(ready) < len(CAPTURE_MAGIC) and healthy() and time.monotonic() < deadline:
+            try:
+                data = connection.recv(len(CAPTURE_MAGIC) - len(ready))
+            except TimeoutError:
+                continue
+            if not data:
+                return
+            ready.extend(data)
+        if ready != CAPTURE_MAGIC:
+            return
+        process = subprocess.Popen([
+            "/usr/bin/parec", "--raw", "--format=s16le", "--rate=48000",
+            "--channels=2", "--device=kde-rdp-sink.monitor", "--latency-msec=20",
+        ], env=environment, stdout=subprocess.PIPE, bufsize=0, pipesize=4096,
+           start_new_session=True, preexec_fn=descendant_setup)
+        try:
+            relay_capture(connection, process.stdout, healthy)
+        finally:
+            stop_process(process)
+            process.stdout.close()
+    except OSError:
+        pass
+    finally:
+        connection.close()
+
+
+
+def wait_for_sink(processes, environment, timeout=5):
+    """Wait for both the sink and WirePlumber's default-node policy.
+
+    PipeWire exposes the sink before WirePlumber creates its default metadata.
+    During that interval, setting the default fails with "Not supported" even
+    though listing sinks succeeds. Keep that startup race inside the deadline.
+    """
+    deadline = time.monotonic() + timeout
+    last_error = "private audio sink unavailable"
+
+    def pactl(*arguments):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(arguments, timeout)
+        return subprocess.run(["/usr/bin/pactl", *arguments], env=environment,
+                              capture_output=True, timeout=min(1, remaining))
+
+    while time.monotonic() < deadline:
+        if any(process.poll() is not None for process in processes):
+            raise RuntimeError("private audio daemon exited")
+        try:
+            sinks = pactl("list", "short", "sinks")
+            if sinks.returncode == 0 and any(
+                    len(fields := line.split()) > 1 and fields[1] == b"kde-rdp-sink"
+                    for line in sinks.stdout.splitlines()):
+                selected = pactl("set-default-sink", "kde-rdp-sink")
+                if selected.returncode == 0:
+                    default = pactl("get-default-sink")
+                    if default.returncode == 0 and default.stdout.strip() == b"kde-rdp-sink":
+                        return
+                else:
+                    last_error = selected.stderr.decode(errors="replace").strip() or last_error
+        except subprocess.TimeoutExpired:
+            last_error = "private audio readiness probe timed out"
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    raise RuntimeError("private audio sink unavailable: " + last_error)
+
+
+ACCESS_SOCKET = 'access.socket = { pipewire-0 = "unrestricted", pipewire-0-manager = "unrestricted" }'
+
+
+def unrestricted_access(text):
+    """Make every client of the private sockets unrestricted.
+
+    The broker connects pipewire-0 in a short-lived child running as the
+    account and hands the descriptor to the frontend; once that child exits,
+    module-access would classify the connection as "flatpak" (restricted) and
+    hide KWin's screencast node. Both sockets live in the 0700 private runtime.
+    """
+    marker = "libpipewire-module-access"
+    start = text.find("{ name = " + marker)
+    if start < 0:
+        raise RuntimeError("PipeWire configuration has no module-access entry")
+    opening = text.find("args = {", start)
+    following = text.find("{ name = ", start + 1)
+    if opening < 0 or (0 <= following < opening):
+        raise RuntimeError("PipeWire module-access entry has no args block")
+    insert = opening + len("args = {")
+    return text[:insert] + "\n            " + ACCESS_SOCKET + text[insert:]
+
+
+def main():
+    runtime = Path(os.environ["KDE_RDP_RUNTIME_DIR"])
+    os.umask(0o077)
+    configuration = runtime / "audio-config"
+    configuration.mkdir(exist_ok=True)
+    # Read distribution defaults, bypassing user configuration that might load
+    # hardware devices or use the local desktop's sockets and saved routing.
+    (configuration / "pipewire.conf").write_text(unrestricted_access(
+        Path("/usr/share/pipewire/pipewire.conf").read_text()).replace(
+            "context.objects = [", '''context.objects = [
+ { factory = adapter args = {
+   factory.name = support.null-audio-sink
+   node.name = kde-rdp-sink
+   node.description = "Remote Desktop Audio"
+   media.class = Audio/Sink
+   audio.position = [ FL FR ]
+   node.virtual = true
+   node.always-process = true
+   priority.session = 2000
+ } }
+'''))
+    (configuration / "pipewire-pulse.conf").write_text(
+        Path("/usr/share/pipewire/pipewire-pulse.conf").read_text())
+    (configuration / "wireplumber.conf").write_text(
+        Path("/usr/share/wireplumber/wireplumber.conf").read_text().replace(
+            "wireplumber.profiles = {", '''wireplumber.profiles = {
+ remote = {
+  inherits = [ main ]
+  hardware.audio = disabled
+  hardware.bluetooth = disabled
+  hardware.video-capture = disabled
+ }
+'''))
+    environment = dict(os.environ, XDG_RUNTIME_DIR=str(runtime),
+                       PIPEWIRE_RUNTIME_DIR=str(runtime), PIPEWIRE_REMOTE="pipewire-0",
+                       PIPEWIRE_CONFIG_DIR=str(configuration),
+                       WIREPLUMBER_CONFIG_DIR=str(configuration),
+                       XDG_STATE_HOME=str(runtime / "audio-state"),
+                       PULSE_SERVER="unix:" + str(runtime / "pulse/native"))
+    def shutdown(*_):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    supervise_graph(runtime, environment)
+
+
+def supervise_graph(runtime, environment):
+    # Days-long desktops may see occasional PipeWire crashes. Each failure
+    # after ten healthy minutes resets the budget, so restarts stay finite in
+    # any ten-minute window without permanently disabling audio.
+    attempt = 0
+    while attempt < GRAPH_ATTEMPTS:
+        started = time.monotonic()
+        try:
+            run_graph(runtime, environment)
+        except (RuntimeError, OSError) as error:
+            print("Private audio graph unavailable: " + str(error), flush=True)
+            if time.monotonic() - started >= GRAPH_HEALTHY_SECONDS:
+                attempt = 0
+            if attempt + 1 == GRAPH_ATTEMPTS:
+                raise
+            time.sleep(0.25 * (2 ** attempt))
+            print("Restarting private audio graph (attempt " + str(attempt + 2) + ")", flush=True)
+        attempt += 1
+
+
+def run_graph(runtime, environment):
+    processes = []
+    try:
+        for command in (["/usr/bin/pipewire"], ["/usr/bin/pipewire-pulse"],
+                        ["/usr/bin/wireplumber", "--profile=remote"]):
+            processes.append(subprocess.Popen(command, env=environment, start_new_session=True,
+                                              preexec_fn=descendant_setup))
+            if command == ["/usr/bin/pipewire"]:
+                for _ in range(100):
+                    if (runtime / "pipewire-0").exists():
+                        break
+                    if processes[-1].poll() is not None:
+                        raise RuntimeError("private PipeWire exited")
+                    time.sleep(0.05)
+                else:
+                    raise RuntimeError("private PipeWire startup timed out")
+        wait_for_sink(processes, environment)
+        socket_path = runtime / "audio-0"
+        socket_path.unlink(missing_ok=True)
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(runtime / "audio-0"))
+            listener.listen(1)
+            listener.settimeout(0.5)
+            while all(p.poll() is None for p in processes):
+                try:
+                    connection, _ = listener.accept()
+                except TimeoutError:
+                    continue
+                capture(connection, environment, processes)
+        raise RuntimeError("private audio daemon exited")
+    finally:
+        (runtime / "audio-0").unlink(missing_ok=True)
+        for process in reversed(processes):
+            stop_process(process)
+
+
+if __name__ == "__main__":
+    main()

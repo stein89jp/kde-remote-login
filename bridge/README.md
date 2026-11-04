@@ -1,0 +1,552 @@
+# Real Wayland/RDP bridge
+
+IronRDP git revision `7b976a6965c96c76ff949313e174ea55dada8c44` owns RDP,
+TLS, optional CredSSP, bitmap codecs, graphics framing and negotiation. This exact revision includes
+`CredentialValidator` and `ConnectionBinder`, absent from crates.io 0.13.0.
+Rust >=1.94 is required. `Cargo.lock` pins every transitive crate and Git source.
+Native dependencies include `libxkbcommon` with `xkeyboard-config` Japanese/evdev data
+and FFmpeg's codec, utility and scaling libraries. Install the distribution's
+`ffmpeg` package before building; the native shim uses `pkg-config` to find it.
+
+Build without installing on the working host:
+
+```sh
+cargo build --manifest-path bridge/Cargo.toml --release --locked
+cargo test --manifest-path bridge/Cargo.toml --locked
+```
+
+Broker mode defaults to `0.0.0.0:33991` for direct Windows connections.
+`KDE_RDP_LISTEN` accepts a numeric IPv4/IPv6 address and nonzero port. Disposable
+mode defaults to `127.0.0.1:33991` and rejects non-loopback configuration and peers.
+No UDP transport, preemption or reconnect cookie is enabled.
+Each TCP connection authenticates through PAM. In broker mode, reconnecting with
+the same authorized Linux account resumes its retained desktop and applications.
+Disconnect closes the frontend Wayland connection and broker lease after held
+input is released; lease EOF detaches the frontend and starts a 45-second grace
+window. Reconnect before expiry to resume; otherwise the broker fully logs out
+and cleans up the desktop, and the next login creates a fresh one after cleanup.
+The timer starts when the broker observes detachment, including frontend exit.
+Logout, compositor exit or broker shutdown ends the desktop immediately.
+The single-connection reject policy remains. Linux TCP keepalive and an
+outstanding-write timeout now detect silent loss independently of desktop activity;
+private blackhole tests measured about 20–23 seconds. Retention starts at observed
+detachment. Installed Windows behavior remains pending validation.
+The disposable mode and namespace test broker do not prove persistent PAM-backed
+resume. A compositor crash terminates the capture stream with the library
+`Ok(None)` contract, ending the connection and releasing its broker lease; the frontend keeps accepting.
+
+The default `KDE_RDP_MODE=broker` connects only to `/run/kde-rdp/broker.sock`.
+`KDE_RDP_OUTPUT` selects the KWin output by name; empty or unset uses KWin's
+first output (`Virtual-0` on the virtual backend). TLS reads `tls-cert` and `tls-key`
+inside systemd's `CREDENTIALS_DIRECTORY`, falling back to explicit
+`KDE_RDP_CERT` and `KDE_RDP_KEY` paths for foreground tests. Broker mode uses
+TLS-only RDP because PAM passwords cannot supply the static NTLM credential
+needed by this library's default NLA backend. Credentials supplied in the
+library's TLS-protected ClientInfo flow reach the broker. Remembered Windows
+domain credentials open an empty Linux login form and are never forwarded to
+PAM. A client omitting its password also receives a
+restricted login screen. No compositor or Linux login session starts until
+the screen submits credentials and the broker accepts them. Incorrect credentials
+clear the password; attempts have a two-second delay and the connection closes
+after five failures. The screen also closes after 60 seconds without a submitted
+attempt or 120 seconds in total (`KDE_RDP_LOGIN_IDLE_SECS`,
+`KDE_RDP_LOGIN_TIMEOUT_SECS`), and failed logins from one client address,
+including direct ClientInfo credentials, start a per-source backoff of up to
+60 seconds; see [installation](../docs/install.md#configuration-and-troubleshooting). The screen supports JP106 physical keys and Unicode character
+events, Tab, Backspace, Enter, and mouse focus/sign-in. Password pixels contain
+a fixed mask, never the secret or its length. Disconnect cancels access to a
+pending desktop binding and releases its lease; a desktop already created by the
+broker remains available for authenticated resume. The display/input adapters switch to the
+real desktop after successful login, including optional NVENC and live resizing.
+Desktop keyboard input uses the authenticated compositor's existing XKB map,
+including layouts, model, variants and options. The bridge observes later map
+changes instead of imposing a Japanese map, and remote modifier synchronization
+preserves the compositor's active layout group.
+The login form uses the same negotiated graphics wrapper as the desktop and
+repaints once per second while waiting for input, so late client surface setup
+or graphics negotiation does not leave a static black screen. The initial
+graphics surface is delivered even during startup output suppression; later
+suppression still pauses desktop output.
+
+Ordinary mstsc can negotiate TLS when the server offers no NLA. An explicit
+`enablecredsspsupport:i:0` profile remains a fallback; policies requiring NLA are
+incompatible. The detailed mstsc negotiation checks remain in
+[acceptance](../docs/acceptance.md).
+
+For a disposable current-UID compositor only, `KDE_RDP_MODE=disposable` uses
+library NLA with explicit disposable `KDE_RDP_USERNAME` and
+`KDE_RDP_PASSWORD`; those are never interpreted as Linux credentials. Set
+`KDE_RDP_WAYLAND_SOCKET` to the **absolute** private test compositor socket and,
+optionally, `KDE_RDP_PIPEWIRE_SOCKET` to that session's PipeWire socket
+(default: `pipewire-0` next to the Wayland socket).
+No inherited `WAYLAND_DISPLAY`, `DISPLAY` or local desktop socket is used.
+The bridge executable accepts no arguments or password flags.
+
+`capture-probe /absolute/private/wayland-socket [output]` captures real
+frames at 640x480 and requires changing application pixels. It injects keyboard,
+pointer, click and disconnect-release requests. Confirm acknowledgements in the
+animated test app's own log; request submission alone is not input proof.
+`kwin-capture-probe` checks frames, resizes, DMA-BUF tickets, a quiet desktop
+and cursor metadata against a real KWin (`lab/kwin/bridge-integration.sh`).
+
+Capture asks KWin for `zkde_screencast_unstable_v1.stream_output` (v6, cursor
+mode metadata) and consumes the resulting PipeWire node in C
+(`src/screencast.c`) over the session's PipeWire connection
+(`pw_context_connect_fd`; the broker passes it, disposable mode connects
+`KDE_RDP_PIPEWIRE_SOCKET`). The `serial` event is the PipeWire
+`target.object`. Formats are BGRx/BGRA with the RDP desktop size as the
+requested size; SHM frames arrive as MemFd, GPU frames as DMA-BUF with the
+explicit NVIDIA block-linear modifiers queried through EGL on the render node
+(`KDE_RDP_GPU_DEVICE` or the NVIDIA node). KWin has only two to four buffers per
+stream, so a MemFd frame is copied at once into a small pool of private slots
+that snapshots then share without copying; a slot still referenced is never
+written again. A DMA-BUF frame stays dequeued in its `GpuFrame` ticket until
+the encoder drops it. `SPA_META_VideoDamage` limits pixel comparisons to damaged
+tiles (merged across frames that were never taken; see
+[performance controls](../docs/performance.md)), and `SPA_META_Cursor` drives
+the separate RDP pointer; cursor-only buffers carry `SPA_CHUNK_FLAG_CORRUPTED`.
+Clients without pointer support get a new stream in embedded cursor mode.
+Resizing renegotiates the stream size, which KWin's virtual output follows;
+output management is never used (docs/kde-findings.md). The client's scale
+request is not applied: KWin's output scale (Plasma display settings) is
+observed through xdg-output and used for input mapping.
+`KDE_RDP_FPS` bounds capture to 1..60 fps (default 60 with NVENC, 30 with bitmap).
+A quiet desktop sends no frames at all; the worker re-sends the retained desktop
+once per second and `wl_display.sync` health probes distinguish idle from
+compositor failure. An eventfd wakes the worker for input. Adjacent motion and
+resize requests coalesce within bounded queues while ordered input remains a
+barrier. Bitmap clients receive sparse rectangles reconstructed from complete
+latest snapshots; video always receives a complete desktop. Output removal,
+stream closure or PipeWire failure closes the connection.
+
+## Desktop codecs
+
+`KDE_RDP_ENCODER=bitmap` is the default transport. Set
+`KDE_RDP_ENCODER=nvenc` to encode the captured BGR0 desktop frames with
+FFmpeg's `h264_nvenc` and send H.264 AVC420 over the negotiated RDP graphics
+channel. Clients without the required graphics/codec capabilities receive bitmap
+updates. The patched headless compositor prefers hardware EGL devices, including
+NVIDIA, and advertises DMA-BUF formats for GPU applications. Its `auto` policy falls back to surfaceless rendering if hardware is unavailable;
+the session worker's `software` policy forces llvmpipe. With NVENC, supported
+DMA-BUF GPU capture is the default (`KDE_RDP_GPU_CAPTURE=auto`) with SHM
+fallback; bitmap mode always uses SHM.
+NVENC accelerates the frontend's video encoding independently of compositor
+rendering. FFmpeg's software scaler converts the captured pixels to full-range
+BT.709 NV12 before NVENC encoding on the SHM path, as required by AVC420. NVDEC is not used; the RDP client decodes the video. The
+default NVENC DMA-BUF/EGL/CUDA path keeps supported capture and BT.709 conversion
+on the GPU, with SHM fallback. See [performance controls](../docs/performance.md).
+
+Color conversion uses up to four FFmpeg workers for larger desktops. A padded
+BGR staging frame enables parallel conversion; small or single-core frames use
+direct conversion with only the final rows copied to SIMD-safe scratch memory.
+NVENC uses its fastest preset, ultra-low-latency tuning, no B frames/lookahead,
+single-pass bounded VBR and a one-frame VBV buffer.
+
+Unchanged desktop pixels skip conversion, GPU upload and transmission. Capture
+heartbeats continue so decoder recovery, minimize/resume and channel negotiation
+can request a new IDR even on a static desktop. Encoding keeps one pending task
+and graphics backpressure bounds unacknowledged frames. Set
+`KDE_RDP_BITRATE_MBPS=1..100` sets the H.264 bitrate ceiling (default 12 Mbps).
+Each connection adapts bitrate toward a 1 Mbps floor when graphics ACK latency
+rises above its baseline, acknowledgements stall, or the client reports a
+decoding backlog, moving between six quantized levels: at most one decrease per
+second, and an increase only after 10 seconds of healthy delivery, applied at
+the next due keyframe or within 30 seconds, because each NVENC rate change costs
+a keyframe. Periodic keyframes are a 30-second safety net
+(`KDE_RDP_GOP_SECONDS`); recovery points still force them immediately. The
+encoder is not recreated for a rate change. Tracking stays bounded
+and resets for reconnects; the graphics acknowledgement-suspension sentinel is
+handled as a protocol mode. Bitmap fallback retains its existing transport.
+See [installation](../docs/install.md#optional-nvidia-encoding) for GPU access and
+renderer policy configuration. GPU capture needs the documented device access and
+a supported import path, otherwise it falls back to SHM;
+server/client decoding timings do not establish physical presentation latency.
+
+Explicit NVENC mode validates the hardware encoder at startup and fails with an
+error if initialization is unavailable. It requires an NVENC-capable NVIDIA GPU,
+driver userspace libraries compatible with FFmpeg's NVENC API version, and access
+to the GPU device nodes. The packaged default systemd unit uses `PrivateDevices`
+and therefore needs the optional `nvidia-frontend.conf` drop-in described in
+[installation](../docs/install.md). Hardware compositor rendering also requires
+the remote-login account to have access to its GPU device nodes. The bridge uses
+prebuilt FFmpeg libraries and does not require the CUDA
+toolkit or Video Codec SDK to build or run.
+
+The release frontend passed actual NVENC AVC420 encoding and FreeRDP decoding
+of an animated Wayland app in private namespaces, including input, reconnects,
+held-input release and compositor failure. A client without graphics support
+also passed the same checks through bitmap fallback while NVENC remained
+configured. Reports are `artifacts/nvenc-tls-integration.json` and
+`artifacts/nvenc-bitmap-fallback-integration.json`. Windows, installed-service
+permissions and complete-path performance remain pending; see
+[acceptance](../docs/acceptance.md).
+
+`encoder-probe OUTPUT.h264` tests the native NVENC encoder without Wayland or
+an RDP listener. It writes 30 changing 1920×1088 H.264 frames and refuses to
+overwrite an existing output file. From source:
+
+```sh
+cargo run --manifest-path bridge/Cargo.toml --locked --bin encoder-probe -- \
+  /tmp/kde-rdp-nvenc.h264
+ffmpeg -v error -i /tmp/kde-rdp-nvenc.h264 -f null -
+ffprobe -v error -select_streams v:0 -count_frames \
+  -show_entries stream=codec_name,width,height,nb_read_frames \
+  -of default=noprint_wrappers=1 /tmp/kde-rdp-nvenc.h264
+```
+
+Require successful decode and 30 H.264 frames at 1920×1088. The eight padded rows
+align the coded height to 16 pixels; RDP region masks crop them to the logical
+1920×1080 desktop. The package installs
+the probe as `/usr/lib/kde-rdp/encoder-probe`; the installation guide shows how
+to run it with the frontend service account's GPU access.
+
+The probe reports mean, median, p95 and maximum encoding latency plus output
+bytes. Optional `KDE_RDP_PROBE_WIDTH` and `KDE_RDP_PROBE_HEIGHT` accept 1..4096,
+and `KDE_RDP_PROBE_FRAMES` accepts 1..10000; defaults preserve the command above.
+Use `KDE_RDP_FPS=60` to test a 60 fps encoding budget. The warmed-up native
+benchmark in `scripts/encoder-bench.c` excludes capture/transport and measures
+180 changing frames after 20 warm-up frames:
+
+```sh
+cc -O3 scripts/encoder-bench.c -o /tmp/kde-rdp-encoder-bench \
+  $(pkg-config --cflags --libs libavcodec libavutil libswscale)
+/tmp/kde-rdp-encoder-bench 0 1920 1080 60 12000000
+/tmp/kde-rdp-encoder-bench 0 3840 2160 60 12000000
+```
+
+Actual NVIDIA compositor rendering plus client decoding can be validated with
+`lab/run-isolated.sh --nvidia-renderer` in place of `--nvenc` in the integration
+command below. It exposes NVIDIA and DRM render nodes, verifies NVIDIA EGL
+selection and DMA-BUF advertisement, and hides physical input and DRM modesetting
+nodes. `--nvenc` retains software compositor rendering for comparison.
+
+The real desktop integration client also needs FreeRDP's client addon library
+to load the graphics channel and its AVC420 decoder. Build it in the prepared
+repository lab:
+
+```sh
+mkdir -p artifacts
+cc -Wall -Wextra -Werror -Wno-deprecated-declarations -O2 \
+  scripts/rdp-desktop-client.c \
+  $(pkg-config --cflags --libs freerdp3 freerdp-client3 winpr3) \
+  -o artifacts/rdp-desktop-client
+lab/run-isolated.sh --nvenc env KDE_RDP_LAB_ENCODER=nvenc \
+  KDE_RDP_LAB_TLS_CONTRACT=1 \
+  KDE_RDP_LAB_BRIDGE=bridge/target/release/kde-rdp-bridge \
+  python3 scripts/headless-integration.py
+```
+
+The explicit `--nvenc` lab mode exposes NVIDIA device nodes and read-only sysfs
+metadata required by CUDA device discovery. Physical input and DRM nodes,
+host homes, display sockets and runtime directories remain hidden. The test
+requires server AVC420 activation and actual FreeRDP AVC420 decoding, then
+checks application input, reconnects and compositor failure.
+Set `KDE_RDP_LAB_GFX=0` in that command to check bitmap fallback for a client
+without graphics support while the host encoder remains configured as NVENC.
+
+Input uses virtual keyboard and virtual pointer v2 bound to the selected output
+and seat. The bridge inherits the compositor's actual XKB map, including the
+host's JP106 layout or explicit user layout, and sends Caps/Num/Scroll lock
+synchronization to Niri. The restricted login form also reads the host's XKB
+defaults before authentication, with Shift, Caps Lock, AltGr and keypad support.
+Held keys/buttons are released at disconnect, and a bounded compositor sync
+acknowledgment completes input teardown before the socket closes.
+RDP set-1 E0 codes map explicitly to Linux evdev codes. Pointer absolute and
+relative motion is bounded before mapping into the capture output. Click
+coordinates travel with the button event. Normal transform and the explicitly selected output scale are required; unsupported layouts fail closed. Unicode events commit exact text through a temporary one-level XKB map, including
+Japanese and UTF-16 surrogate pairs (emoji). Each character is a balanced tap; the
+physical keymap and held modifiers are restored afterward. Phone-side IME
+composition can submit committed text this way. Pause/E1 and lock-screen behavior remain work. The bidirectional
+clipboard carries Unicode text, HTML and images (not files) over CLIPRDR and
+private-session Wayland data control, with bounded payloads/deadlines and
+reconnect cleanup; host-local clipboard access is excluded. Mouse wheel notches
+are sent as discrete steps, so Niri wheel bindings and clients' `axis_value120`
+work.
+
+## Session audio
+
+Broker sessions redirect application playback to the RDP client over the
+TLS-protected `rdpsnd` channel. Each desktop starts its own PipeWire,
+PipeWire-Pulse and WirePlumber instances, with a virtual default output named
+**Remote Desktop Audio**. Hardware discovery is disabled on that private graph.
+Applications use its private runtime and Pulse socket; the frontend receives
+only a broker-authorized versioned PCM capture descriptor, without access to the user's runtime.
+This follows GNOME Remote Login's session-playback model: capture an audio sink
+and send it through RDP ([GNOME implementation](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c)).
+
+Capture is stereo 48 kHz, signed 16-bit little-endian PCM. Since 2026-10-20
+(user-approved) the frontend prefers **44.1 kHz stereo PCM** (`WAVE_FORMAT_PCM`,
+2 channels, 44100 Hz, 176400 bytes/s, block align 4, 16 bits; about
+1.41 Mbit/s). With 48 kHz PCM, Windows 10 mstsc fell about 25 s behind video
+after 5 minutes of continuous playback, about 8.8% slow (48000/44100), while
+the server sent exactly real time: mstsc appears to play 48 kHz PCM at
+44.1 kHz. The bridge converts each 20 ms capture block (960 frames) with
+FFmpeg libswresample (64-tap filter) into exactly 882 frames, 3528 bytes per
+wave: the first block after a reset is led by the filter's 33-frame delay as
+silence, and every later block is exactly full, so nothing queues between
+blocks and the output rate equals the capture rate. The resampler restarts
+after actual sample loss and at silence suppression, never for an ordinary
+credit wait. The offer order is 44.1 kHz stereo PCM, 48 kHz stereo PCM
+(passed through unchanged, about 1.54 Mbit/s), then AAC-LC and MS ADPCM; no
+mono is offered. `KDE_RDP_AUDIO_RATE=48000` restores the former order
+(48 kHz stereo PCM first, no 44.1 kHz PCM) for comparison tests; invalid values
+warn and use 44100. Mono PCM is opt-in with `KDE_RDP_AUDIO_CHANNELS=mono` (at
+48 kHz it sounded pitched-up and robotic in actual Windows 10 mstsc on
+2026-10-20 and must not be the default): the frontend then downmixes each
+stereo frame to (L+R)/2, rounding halves away from zero without overflow,
+before resampling, and offers mono PCM at the selected rate first (44.1 kHz:
+1764 bytes per 20 ms wave, 88200 bytes/s; 48 kHz: 1920 bytes, 96000 bytes/s).
+At each audio channel start the journal lists the client-accepted formats
+(`RDP audio formats: client accepted [...]; chosen ...`). A 20-minute continuous YouTube playback in actual Windows 10
+mstsc with the 44.1 kHz default was clean and in sync (user-confirmed
+2026-10-20; longer runs, constrained bandwidth and repeated reconnects remain
+acceptance checks). Windows 10 mstsc playback was intelligible with PCM, but
+both compressed offers have produced static in actual listening checks. Clients
+that do not accept PCM can use GNOME Remote Login's AAC-LC format: `AAC_MS`, stereo 44.1 kHz at 96 kbit/s,
+1024 sample frames per raw packet, with no ADTS header or WAVE extra data.
+FFmpeg resamples capture with bounded buffers; encoder lookahead remains below
+two AAC frames. MS ADPCM is the last fallback. No
+additional audio configuration is required. A client must enable
+remote playback and accept one of these formats. Microphone redirection is a
+separate path; see [Microphone](#microphone). Audio starts after
+successful Linux authentication, including submission through the login form.
+Disconnect closes capture; authenticated reconnect opens a fresh monitor of the
+retained desktop. At most four waves await receipt confirmation. Optional later
+confirmations provide playback delay measurements; they are never required to
+release a second credit. Fresh completion feedback can describe a wave queued
+for more than a second if the same playback run is still active and its block
+number has not been reused. Feedback from an earlier run, ambiguous reused
+numbers and implausible timestamp delays cannot restart recovery. Timestamp
+delays must fit the elapsed time plus a 300 ms device scheduling allowance.
+Valid feedback above 300 ms briefly discards capture while the queued tail
+drains. Each measurement can extend recovery by at most one second; distinct
+fresh completions can extend the drain, but optional replies never become
+required credits. Recovery expires and resumes consecutive fresh packets,
+allowing AAC to progress beyond priming.
+Missing replies, mixed single/double confirmations and old idle waves cannot
+permanently mute sound or create an ever-growing delay. Later receipt progress
+also retires missing earlier confirmations. Actual audio congestion reduces
+the live H.264 target even when graphics acknowledgements are healthy or
+suspended; recovery waits for three seconds without audio pressure.
+mstsc confirms waves on arrival, so audio queued inside mstsc is invisible to
+the server. Device clock drift and bursts after network stalls can make that
+queue, and the audio delay, grow during continuous sound; only suppressed
+silence used to let it drain. For PCM, the bridge therefore drops an audible
+20 ms block when the drop is earned (since 2026-10-20; a blind drop every 30 s
+kept sync but drained the client's jitter cushion and sounded crackly). The
+bridge simulates a client that starts empty, receives each wave when its first
+Wave Confirm arrives and plays it 100 ppm slower than real time, as a slow
+client clock would. Its queue just before each arrival, at the minimum over the
+last one to two seconds and capped at 1 s, estimates the surplus in mstsc's
+queue: stalls followed by bursts of late waves raise it (four transport
+credits bound one burst to about 80 ms less the round trip), sending gaps lower
+it, and capture discarded as stale or under pressure was never sent, so it earns
+nothing. Because mstsc may rebuild a larger queue after running dry, which
+receipts cannot show, the model's running dry for at least 100 ms within a sound
+run (a likely underrun) adds 20 ms of starvation credit, at most once per 30 s,
+which is never faster than the former blind 667 ppm. A drop that the observed
+queue cannot absorb uses that credit. A drop needs a surplus of at least a 60 ms jitter reserve plus 20 ms,
+and at least 10 s since the previous drop or since sound started or resumed;
+silence suppression empties the estimate and the credit, and receipts of waves
+sent before it are ignored. Steady audio earns only the drift allowance: 20 ms
+per 200 s at the default 100 ppm, so its first drop comes after about 800 s of
+continuous sound. Frontend settings, read once at startup and defaulting to
+this baseline, tune it: `KDE_RDP_AUDIO_DRIFT_PPM` (0–2000, default 100) sets
+the allowance, `KDE_RDP_AUDIO_CHANNELS=mono` opts in to mono PCM first
+(default `stereo`, no mono offered) and `KDE_RDP_AUDIO_RATE` selects the
+preferred PCM rate (default `44100`); invalid values warn and keep the default.
+The `RDP audio PCM` start line reports `channels`, `rate`, `drift_ppm` and
+whether the drift skip is on, for example `RDP audio PCM: 44100 Hz stereo,
+1411 kbps, 20.00 ms blocks; channels=stereo rate=44100 drift_ppm=100
+drift_skip=on`. The drop, its level checks and the crossfade act on the 48 kHz
+stereo capture block; downmix and resampling follow. While armed, the catch-up drops the first quiet block: mean
+absolute level at most about -40 dBFS, or at most a quarter of the recent
+average level. If no quiet block arrives within 5 s, it drops the next audible
+block. Digital silence is never dropped. The
+following block starts with a 5 ms linear crossfade from the dropped block's
+first frames, so the splice does not click. The send schedule is unchanged: a
+queued successor takes the dropped block's tick; otherwise the next block leaves
+on its normal tick when captured. A drop is not counted as capture loss, a
+credit wait or audio pressure, and it does not reset codec state. AAC and MS
+ADPCM fallbacks never drop blocks; their behavior is unchanged. The connection
+summary counts drops in `audio_drift_skips`, and model starvations and their
+total length in `audio_model_starvations` and `audio_model_starved_ms`. With
+`KDE_RDP_DIAGNOSTICS=1`, each drop logs `RDP audio drift skip`, including the
+surplus it relied on as `earned_ms`, which the 5 s `RDP audio confirms`
+summaries also report. Wave Confirms log `RDP audio confirm` lines
+for a stream's first 32 confirmations and first 32 nonzero echoed timestamps,
+with block number, echoed timestamp and first-to-second confirmation gap.
+`RDP audio confirms` summaries follow every 5 s.
+The bridge paces blocks by their exact sample duration and retains a three-block
+capture FIFO to absorb ordinary PipeWire batching. Excess backlog drops the
+oldest complete blocks while preserving partial-sample alignment. Capture also
+expires after 60 ms of frontend buffering. Continuous digital silence is
+suppressed after a short codec tail, and AAC state resets when a transport or
+playback hold discards capture so old lookahead is discarded. Waiting for credit
+without dropping capture preserves codec state. The session monitor also drains
+capture continuously through socket stalls with bounded buffers.
+Like GNOME, RDPSND timestamps are zero: this desktop uses RDPGFX, without the
+RDPEVOR shared presentation clock that the Wave2 audio timestamp accompanies.
+Internal monotonic times still bound queue age and measure confirmation delays.
+The private NRA1 framing carries sequence and CLOCK_MONOTONIC source/relay times.
+Source age begins at the helper's first monitor read, excluding earlier application
+and PipeWire buffering. The frontend expires capture using that source age.
+Audio waits on readiness, feedback and exact pacing deadlines instead of fixed
+two-millisecond polling. Private graph/helper retries are finite; ancillary audio
+failure permits a usable desktop and reconnect obtains a fresh capture descriptor. Actual Windows
+lip-sync and recovery are checked separately; client output latency is not a
+server-controlled shared presentation clock.
+Disposable compositor mode has no audio backend.
+
+`python3 -m unittest tests.test_audio -v` runs real private PipeWire playback,
+captures a tone and repeats after reconnect, and verifies AAC and ADPCM
+encode/decode with guarded source buffers. Rust tests negotiate the audio
+formats, verify the default stereo-first offer with exact fields and no mono, the mono
+opt-in offer, mono preference under the opt-in
+with exact (L+R)/2 samples, stereo selection with exact signed stereo samples in
+both WaveInfo/Wave and Wave2 PDUs, and the client's format index. They check
+downmix extremes, the earned surplus (drift allowance only for steady audio,
+burst credit above the reserve, starvation credit at most once per 30 s and
+never across silence suppression or for AAC/ADPCM, no credit for discarded
+capture, return-path batching, the cap and the reset at silence suppression),
+the audio settings' parsing, mono opt-in with `KDE_RDP_AUDIO_CHANNELS`, the
+44.1 kHz-first offer and `KDE_RDP_AUDIO_RATE=48000` restoring the former one,
+3528-byte 44.1 kHz waves with the client's format index on both wave PDU
+versions, exactly 882 resampled frames per block for ten minutes without queue
+growth, tone frequency and level after resampling, resampler continuity across
+credit waits and its restart after sample loss and silence, the drift skip on
+the 44.1 kHz path, drift-skip arming and spacing, quiet preference,
+forced drops, restart after silence, crossfade continuity and an unchanged send
+schedule. They also check
+backpressure, long playback feedback, timestamp/block wrapping, healthy sample
+continuity and disconnect cleanup. Installed-service and Windows mstsc sound
+playback remain actual-machine acceptance checks.
+
+## Microphone
+
+`src/microphone.rs` implements mstsc **Record from this computer** (MS-RDPEAI,
+the `AUDIO_INPUT` dynamic channel) through the vendored server's
+`RdpeaiServerFactory`, using the `ironrdp-rdpeai` crate at the same pinned
+IronRDP revision. `KDE_RDP_MICROPHONE=auto` (default) registers the factory;
+`off` registers nothing, so no `AUDIO_INPUT` channel is offered, and drops the
+broker's microphone descriptor. Any other value fails startup.
+
+The path shares nothing with playback except the TLS connection and the server
+event loop: its own dynamic channel (playback uses the `rdpsnd` static channel),
+its own `rdp-microphone` thread per helper connection, its own bounded queue,
+its own socket (`audio-in-0`, the optional third descriptor of the
+[broker reply](../broker/README.md#wire-contract-v2)), its own NRM1 framing,
+helper (`session-microphone`) and restart budget, and its own `mic_*` summary
+counters. The microphone path does not change `audio.rs` or RDPSND playback.
+
+The server offers 16-bit PCM at 48 kHz mono, 48 kHz stereo, 44.1 kHz mono and
+44.1 kHz stereo, in that order, each as WAVE_FORMAT_EXTENSIBLE and plain PCM,
+and requests 20 ms packets. 48 kHz mono needs about 0.8 Mbit/s of upload before
+framing. Recording is server-initiated, and the bridge sends `Open` only when
+formats are negotiated, the session helper is attached and it reports a remote
+recorder (`IN_USE`). When the helper reports `IDLE` (after its own 5-second
+debounce), the bridge asks the server to recycle the channel: MS-RDPEAI has no
+stop PDU, so closing the channel is what releases the Windows microphone. A
+fresh channel is created at once, so the next recorder needs no reconnect.
+A refused open tries the next format; when all fail, the client is asked again
+only on a recorder start at least 30 seconds later. An unanswered Open is
+abandoned after 10 s, as a failed open.
+
+`on_audio_data` validates the length against the format and pushes whole
+frames to a drop-oldest queue of at most 100 ms without blocking the server
+loop. The writer thread sends NRM1 records (`!4sBBHIIIQ`: magic, kind,
+channels, flags, rate, sequence, length, CLOCK_MONOTONIC receive time) over a
+non-blocking socket with an 8 KiB send buffer and never sends audio older than
+100 ms. The helper answers with 8-byte `!4sBBH` records (`HELLO`, `IN_USE`,
+`IDLE`). A protocol error or helper exit is logged once
+(`RDP microphone ...` in the journal); the microphone is then unavailable until
+the next connection, while desktop and playback continue.
+
+The pinned upstream server cannot stop capture, and its DRDYNVC treats data for
+a removed channel as fatal. The vendored `ironrdp-server` therefore adds
+`ServerEvent::RdpeaiRecycle` (`src/rdpeai_recycle.rs`, recorded in
+`vendor/ironrdp-server/UPSTREAM`): it closes the open `AUDIO_INPUT` channel,
+which runs the backend's `on_close`, creates a fresh one from the factory, and
+drops capture data the client sent before it processed the Close (up to 8
+closed channel ids). RDPSND, EGFX and CLIPRDR handling is untouched. It is a
+candidate for upstreaming.
+
+`cargo test` covers format choice, Open only after negotiation and `IN_USE`,
+length validation, the queue bound and drop-oldest under a stalled writer, the
+Open timeout and retry window, and clean shutdown.
+`tests/microphone_wire.rs` runs negotiation, Open, Data and the recycle
+(including late data for a recycled channel) through the crate's client side
+offline. `python3 -m unittest tests.test_microphone -v` covers the session
+helper, including `ECONNRESET` when the frontend closes. The namespace check with real Niri, PipeWire and
+FreeRDP is `lab/run-isolated.sh env KDE_RDP_LAB_BRIDGE=<bridge> python3
+scripts/microphone-integration.py`; see the
+[validation record](../docs/validation.md#microphone-redirection-ms-rdpeai-2026-10-15).
+Windows mstsc recording remains an actual-machine acceptance check.
+
+## Dynamic resolution
+
+The frontend honors the client's initial desktop dimensions, bounded to 4096
+pixels per axis. During the session, clients with the RDP Display Control channel
+can request a new single-display layout at the origin. Live dimensions must be
+200..4096 pixels per axis, with even width as required by Display Control; odd
+heights and portrait layouts are supported. Unsupported layouts are ignored.
+Clients without Display Control keep their initial size. Display Control desktop scale metadata selects logical output scaling when
+`KDE_RDP_SCALE=client` (default); an explicit 1.0–5.0 override takes precedence.
+Physical RDP pixels remain distinct from logical application coordinates. The
+initial scale is 1 until client scale metadata is available.
+
+The capture worker applies each mode through wlr output management on its
+authenticated Wayland connection and verifies Niri's current mode. The maintained
+headless compositor patch updates the existing output, so applications and
+workspaces survive and reflow. Frames and pointer coordinates use the same size;
+IronRDP reactivates the desktop before sending pixels at the new resolution.
+NVENC recreates its encoder and graphics surface and begins with an IDR frame;
+codec padding is cropped to the logical desktop.
+
+Rebuild **both** `kde-rdp-headless` and `kde-remote-login`. The older delivery
+archives and upstream headless backend do not include native mode changes.
+Choose the desired resolution in your RDP client and enable its dynamic
+resolution option to follow window-size changes. Windows mstsc interoperability
+remains an actual-machine acceptance gate.
+
+The namespace integration probe requests 1001×701 initially, then resizes to
+702×1001, 1002×701, and 702×1001 without reconnecting. At each size it checks
+FreeRDP-decoded geometry, native/logical Niri output dimensions, application
+keyboard input and center-pointer click/release. Use the existing integration
+commands above with the current debug or release frontend and rebuilt compositor.
+
+Broker transport is the bounded `NRB3` request (credentials, the client's
+desktop size when known, and the client address for `PAM_RHOST`); username
+1..64, password 1..512 bytes. The reply is `NRB3 + status`: 0 plus one to four
+ordered CLOEXEC SCM_RIGHTS FDs (Wayland, PipeWire, PCM, microphone; exposed as
+`broker::Session::{socket, pipewire, audio, microphone}`); the PCM socket starts capture after receiving one ASCII `A`
+readiness byte. Statuses 1–5 are listed in the
+[broker protocol](../broker/README.md). The broker lease remains open until the
+authenticated backend drops. No filesystem access
+to the target user's runtime is needed by the frontend. Broker receive supports
+fragmented replies and rejects truncated/excess FD transport.
+
+The disposable Arch namespace validation passed real Niri application capture,
+FreeRDP/NLA decoded frames, keyboard/pointer/button acknowledgments, wrong
+credentials, held-input disconnect/reconnect release and compositor SIGKILL
+(client closes within 5 seconds; frontend remains alive). See CHECKPOINT.md for
+exact commands. PAM/logind boot, Windows mstsc and physical-monitor tests remain
+pending actual separate machines.
+
+Production broker-mode TLS-only transport was also validated using a namespace
+test broker (then `NRB1`) handing a real Niri FD: actual ClientInfo credential delivery,
+auth rejection, desktop binding and all accepted lease EOF checks passed. This
+fixture is transport validation only and does not replace real PAM/logind boot
+testing. The FreeRDP client enables automatic logon to send TLS ClientInfo
+credentials; it retries rejected TLS attempts, whose client error is currently
+a generic transport failure. See coordinator validation for the packaged rerun.
+
+## Upgrade controls and measurements
+
+See [performance](../docs/performance.md) for profile, codec, GPU capture, link
+budget, DPI, diagnostics and reproducible private workload controls. AVC444 and
+new graphics cadence/window policies remain opt-in pending comparative and
+Windows acceptance. Login rendering caches its background and complete refresh;
+bitmap field edits repaint a region, and password edits under the fixed nonempty
+mask do not trigger pixel notifications. XKB maps are cached on their owning
+input thread.

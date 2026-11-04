@@ -1,0 +1,193 @@
+#!/bin/sh
+# Only the root broker launches this fixed executable after switching UID.
+set -eu
+: "${KDE_RDP_RUNTIME_DIR:?broker private session directory missing}"
+if [ "${1:-}" != "--environment-ready" ]; then
+    exec /usr/lib/kde-rdp/session-environment /usr/lib/kde-rdp/session-worker --environment-ready
+fi
+# logind retains its genuine /run/user/UID registration. The compositor and
+# applications use a private runtime so no local Wayland or desktop bus is reused.
+export XDG_RUNTIME_DIR="$KDE_RDP_RUNTIME_DIR"
+# Initial size of KWin's virtual output: the RDP client's desktop size when
+# the broker knows it (KDE_RDP_WIDTH/KDE_RDP_HEIGHT), else 1920x1080. The
+# broker already clamps; repeat the check so a bad value can never reach KWin.
+valid_dimension() {
+    case "$1" in ''|0*|*[!0-9]*|?????*) return 1 ;; esac
+    [ "$1" -ge 200 ] && [ "$1" -le 4096 ]
+}
+width="${KDE_RDP_WIDTH-}"
+height="${KDE_RDP_HEIGHT-}"
+if [ -z "$width$height" ]; then
+    width=1920
+    height=1080
+elif ! valid_dimension "$width" || ! valid_dimension "$height" || [ $((width % 2)) -ne 0 ]; then
+    echo "ignoring invalid initial desktop size ${width}x${height}; using 1920x1080" >&2
+    width=1920
+    height=1080
+fi
+unset KDE_RDP_WIDTH KDE_RDP_HEIGHT
+# This root-owned file contains one policy word, never executable shell code.
+# KWin's screencast (the frontend's only frame source) needs OpenGL
+# compositing on a DRM render node; KWin never scans out here, so the card
+# nodes, DRM master and KWIN_DRM_DEVICES do not apply. KWin's software device
+# needs /dev/udmabuf, which uaccess grants only to the active local seat, so
+# software rendering is unsupported (docs/kde-findings.md sections 3 and 6).
+#   auto/hardware: the system's Mesa/glvnd/NVIDIA selection on a render node.
+#   software: refused with an explanation.
+renderer=auto
+if [ -f /etc/kde-rdp/renderer.conf ]; then
+    IFS= read -r renderer < /etc/kde-rdp/renderer.conf || {
+        echo 'cannot read /etc/kde-rdp/renderer.conf' >&2
+        exit 1
+    }
+fi
+case "$renderer" in
+    auto|hardware) unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER __EGL_VENDOR_LIBRARY_FILENAMES ;;
+    software)
+        echo 'renderer.conf: software rendering is not supported; KWin screencast needs a GPU render node (set auto)' >&2
+        exit 1 ;;
+    *) echo 'renderer.conf must contain auto or hardware' >&2; exit 1 ;;
+esac
+# The account needs read/write access to a render node (Arch's default udev
+# rules make them 0666; otherwise add the account to the "render" group) and,
+# on NVIDIA, to /dev/nvidia* (prepared by kde-rdp-nvidia-devices.service).
+render_node=
+for node in /dev/dri/renderD*; do
+    if [ -c "$node" ] && [ -r "$node" ] && [ -w "$node" ]; then
+        render_node=$node
+        break
+    fi
+done
+if [ -z "$render_node" ]; then
+    echo 'no DRM render node (/dev/dri/renderD*) is readable and writable by this account; KDE-RDP needs GPU compositing' >&2
+    exit 1
+fi
+for node in /dev/nvidia0 /dev/nvidiactl; do
+    if [ -e "$node" ] && { [ ! -r "$node" ] || [ ! -w "$node" ]; }; then
+        echo "warning: $node is not readable and writable by this account; NVIDIA rendering will fail" >&2
+    fi
+done
+export KDE_RDP_RENDERER="$renderer"
+unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET SSH_AUTH_SOCK
+# Session-scoped KDE configuration overlay, never written to the account's
+# ~/.config: a private XDG_CONFIG_DIRS entry ahead of the system ones. The
+# $i marker makes the single key immutable, so it also wins over a value the
+# user's own kwinrc might set, and leaves every other setting alone.
+#   shakecursorEnabled: the shake-cursor effect paints an enlarged cursor into
+#   screencast frames (with cursor metadata hidden), so it must stay off in
+#   remote sessions.
+overlay="$KDE_RDP_RUNTIME_DIR/xdg-config"
+mkdir -p "$overlay"
+printf '%s\n' '# Generated per remote session by /usr/lib/kde-rdp/session-worker.' \
+    '[Plugins]' 'shakecursorEnabled[$i]=false' > "$overlay/kwinrc"
+export XDG_CONFIG_DIRS="$overlay:${XDG_CONFIG_DIRS:-/etc/xdg}"
+export PIPEWIRE_RUNTIME_DIR="$KDE_RDP_RUNTIME_DIR"
+export PIPEWIRE_REMOTE=pipewire-0
+export PULSE_SERVER="unix:$KDE_RDP_RUNTIME_DIR/pulse/native"
+# Boot-time centiseconds from /proc/uptime: monotonic, no subprocess. If it
+# is unreadable, no helper run ever counts as healthy (the old fixed budget).
+uptime_now() {
+    read -r uptime _ < /proc/uptime 2>/dev/null || uptime=0.00
+    uptime_cs=$((${uptime%.*} * 100 + 1${uptime#*.} - 100))
+}
+/usr/lib/kde-rdp/session-audio &
+audio_pid=$!
+uptime_now
+audio_started=$uptime_cs
+attempt=0
+while [ ! -S "$KDE_RDP_RUNTIME_DIR/audio-0" ]; do
+    kill -0 "$audio_pid" 2>/dev/null || { echo 'remote audio unavailable; starting desktop without audio' >&2; break; }
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 150 ] || { echo 'remote audio startup delayed; starting desktop while audio recovers' >&2; break; }
+    sleep 0.1
+done
+# The remote microphone helper is separate from playback: its own socket
+# (audio-in-0), its own pw-cat restart budget and its own two retries below.
+# Nothing waits for it; a missing microphone never delays or ends the desktop.
+/usr/lib/kde-rdp/session-microphone &
+mic_pid=$!
+uptime_now
+mic_started=$uptime_cs
+mic_restarts=0
+mic_healthy_seconds=600
+mic_supervised=1
+mic_retry_ticks=0
+# Keep the private helper supervised after KWin starts. A healthy desktop is
+# independent of ancillary audio. Restart the helper at most twice in a row; a
+# helper that ran ten healthy minutes earns a fresh budget, so restarts stay
+# finite in any window without losing audio for days. Its own graph supervisor
+# has three finite attempts. Never use shared services.
+# KWin's virtual backend (no seat, no DRM master, no lock screen) listens on
+# $KDE_RDP_RUNTIME_DIR/wayland-0, where the broker connects for the frontend.
+# KWin starts session-plasma once Xwayland is ready and exits when it ends.
+# The output name is whatever KWin reports; the frontend probes it.
+/usr/bin/kwin_wayland --virtual --xwayland --no-lockscreen --socket wayland-0 \
+    --width "$width" --height "$height" \
+    --exit-with-session=/usr/lib/kde-rdp/session-plasma &
+desktop_pid=$!
+audio_restarts=0
+audio_healthy_seconds=600
+audio_supervised=1
+cleanup() {
+    trap - EXIT TERM INT
+    kill "$desktop_pid" "$audio_pid" 2>/dev/null || :
+    kill "$mic_pid" 2>/dev/null || :
+    wait "$desktop_pid" 2>/dev/null || :
+    wait "$audio_pid" 2>/dev/null || :
+    wait "$mic_pid" 2>/dev/null || :
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+while kill -0 "$desktop_pid" 2>/dev/null; do
+    if [ "$audio_supervised" -eq 1 ] && ! kill -0 "$audio_pid" 2>/dev/null; then
+        wait "$audio_pid" 2>/dev/null || :
+        # Judge health once, at exit: time spent dead never earns a reset.
+        uptime_now
+        if [ $((uptime_cs - audio_started)) -ge $((audio_healthy_seconds * 100)) ]; then
+            audio_restarts=0
+        fi
+        if [ "$audio_restarts" -lt 2 ]; then
+            audio_restarts=$((audio_restarts + 1))
+            sleep "$audio_restarts"
+            /usr/lib/kde-rdp/session-audio &
+            audio_pid=$!
+            uptime_now
+            audio_started=$uptime_cs
+            echo "private audio helper restart $audio_restarts of 2; active clients reconnect for fresh capture" >&2
+        else
+            audio_supervised=0
+        fi
+    fi
+    # Microphone retries count loop ticks instead of sleeping, so they never
+    # delay playback supervision. Same finite policy, separate variables.
+    if [ "$mic_supervised" -eq 1 ]; then
+        if [ "$mic_retry_ticks" -gt 0 ]; then
+            mic_retry_ticks=$((mic_retry_ticks - 1))
+            if [ "$mic_retry_ticks" -eq 0 ]; then
+                /usr/lib/kde-rdp/session-microphone &
+                mic_pid=$!
+                uptime_now
+                mic_started=$uptime_cs
+            fi
+        elif ! kill -0 "$mic_pid" 2>/dev/null; then
+            wait "$mic_pid" 2>/dev/null || :
+            uptime_now
+            if [ $((uptime_cs - mic_started)) -ge $((mic_healthy_seconds * 100)) ]; then
+                mic_restarts=0
+            fi
+            if [ "$mic_restarts" -lt 2 ]; then
+                mic_restarts=$((mic_restarts + 1))
+                mic_retry_ticks=$((mic_restarts * 2))
+                echo "remote microphone helper stopped; retry $mic_restarts/2" >&2
+            else
+                mic_supervised=0
+                echo 'remote microphone helper stopped; microphone off for this session' >&2
+            fi
+        fi
+    fi
+    sleep 0.5
+done
+set +e
+wait "$desktop_pid"
+result=$?
+exit "$result"

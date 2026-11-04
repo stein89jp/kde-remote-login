@@ -1,0 +1,117 @@
+#!/usr/bin/python3
+"""Start the remote Plasma session inside KWin's --exit-with-session slot.
+
+KWin runs this after its Wayland socket and Xwayland are ready (WAYLAND_DISPLAY,
+DISPLAY and XAUTHORITY are set). When KWin exits (Plasma logout), the worker and
+the broker's logind session end with it.
+
+Everything stays on the session's private runtime and private D-Bus bus. The
+host's systemd user manager and its plasma-*.service units belong to local
+logins: never import this environment there and never use startplasma-wayland,
+which boots through systemd. See docs/kde-findings.md section 5.
+"""
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+LIBEXEC = Path("/usr/lib/kde-rdp")
+PLASMA_SESSION = "/usr/bin/plasma_session"
+KDED = "/usr/bin/kded6"
+PLASMASHELL = "/usr/bin/plasmashell"
+# plasma_session's non-systemd startup launches its own kwin_wayland_wrapper
+# (a nested KWin inside ours) unless this name is already owned on the bus.
+KWIN_WRAPPER = "org.kde.KWinWrapper"
+SESSION = {
+    "XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_DESKTOP": "KDE",
+    "XDG_SESSION_TYPE": "wayland", "KDE_FULL_SESSION": "true", "KDE_SESSION_VERSION": "6",
+}
+
+
+def session_environment(environment):
+    runtime = environment.get("KDE_RDP_RUNTIME_DIR")
+    if not runtime or environment.get("XDG_RUNTIME_DIR") != runtime:
+        raise RuntimeError("session-plasma requires the private runtime")
+    if not environment.get("WAYLAND_DISPLAY") or not environment.get("DBUS_SESSION_BUS_ADDRESS"):
+        raise RuntimeError("session-plasma requires KWin's display and the private bus")
+    return dict(environment, KDE_SESSION_UID=str(os.getuid()), **SESSION)
+
+
+def activation_environment(environment):
+    # startplasma normally syncs the whole environment. The private
+    # dbus-daemon started before KWin, so without this D-Bus-activated Qt
+    # services (kactivitymanagerd via powerdevil) start without the display
+    # and abort, and plasmashell then refuses to load.
+    return {key: value for key, value in environment.items()
+            if key.isidentifier() and "\0" not in value}
+
+
+def connect_bus():
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+    return Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+
+def prepare_bus(bus, environment):
+    """Export the environment and hold org.kde.KWinWrapper for the session.
+
+    The name stays owned as long as this process (and its bus connection)
+    lives, which is the whole Plasma session.
+    """
+    from gi.repository import Gio, GLib
+    bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                  "UpdateActivationEnvironment",
+                  GLib.Variant("(a{ss})", (activation_environment(environment),)),
+                  None, Gio.DBusCallFlags.NONE, 5000, None)
+    # 4 = DBUS_NAME_FLAG_DO_NOT_QUEUE; 1 = primary owner.
+    reply = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                          "RequestName", GLib.Variant("(su)", (KWIN_WRAPPER, 4)),
+                          GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, 5000, None)
+    if reply.unpack()[0] != 1:
+        raise RuntimeError(KWIN_WRAPPER + " is already owned on the private bus")
+
+
+# ---------------------------------------------------------------------------
+# Plasma launch: the single place that decides how the shell starts
+# (docs/kde-findings.md section 5).
+#
+# plasma_session is Plasma's own non-systemd session: it starts ksmserver and
+# kded6, restores the session and runs the XDG autostart phases, including
+# plasmashell (/etc/xdg/autostart/org.kde.plasmashell.desktop). It therefore
+# replaces session-autostart's application launch; only the input-method
+# preparation (private IBus/Fcitx transport) runs first.
+#
+# Fallback without plasma_session: kded6, session-autostart (which skips
+# X-systemd-skip entries such as plasmashell's) and plasmashell itself.
+# ---------------------------------------------------------------------------
+def start_plasma(environment):
+    prepare = subprocess.run([str(LIBEXEC / "session-autostart"), "--prepare"], env=environment)
+    if prepare.returncode != 0:
+        print("kde-rdp: input method preparation failed", file=sys.stderr)
+    if os.access(PLASMA_SESSION, os.X_OK):
+        return subprocess.run([PLASMA_SESSION], env=environment).returncode
+    print("kde-rdp: plasma_session not found; starting plasmashell directly", file=sys.stderr)
+    subprocess.Popen([KDED], env=environment)
+    subprocess.Popen([str(LIBEXEC / "session-autostart")], env=environment)
+    return subprocess.run([PLASMASHELL, "--no-respawn"], env=environment).returncode
+
+
+def main():
+    environment = session_environment(dict(os.environ))
+    os.environ.update(environment)
+    # Keep the connection referenced until exit: GIO holds the shared bus only
+    # weakly, and dropping it would release org.kde.KWinWrapper.
+    bus = connect_bus()
+    prepare_bus(bus, environment)
+    # The portal frontend reads KWin's display from this environment; its own
+    # desktop list prefers the host's kde-portals.conf, then kde-rdp-portals.conf.
+    subprocess.Popen([str(LIBEXEC / "session-portals")], env=environment)
+    try:
+        return start_plasma(environment)
+    finally:
+        bus.close_sync(None)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

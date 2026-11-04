@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Disposable Arch userspace. No host DISPLAY, runtime directory, physical input,
+# network, service manager, home, PAM files or writable /usr are visible.
+# --nvenc exposes NVIDIA devices but keeps software compositor rendering.
+# --nvidia-renderer also exposes render nodes and requires hardware rendering.
+set -euo pipefail
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+args=(--unshare-all --die-with-parent --new-session --ro-bind /usr /usr
+      --symlink usr/lib /lib --symlink usr/lib /lib64
+      --ro-bind /etc/os-release /etc/os-release --proc /proc --dev /dev
+      --tmpfs /tmp --tmpfs /run --dir /etc --dir /home --dir /home/test
+      --bind "$repo" /work --chdir /work
+      --clearenv --setenv PATH /usr/bin --setenv HOME /home/test
+      --setenv XDG_RUNTIME_DIR /tmp/kde-rdp-runtime
+      --setenv NIRI_BACKEND headless --setenv LIBGL_ALWAYS_SOFTWARE 1
+      --setenv KDE_RDP_RENDERER software
+      --setenv GALLIUM_DRIVER llvmpipe --setenv XKB_CONFIG_ROOT /usr/share/X11/xkb
+      --setenv LD_LIBRARY_PATH /work/lab/sysroot/usr/lib)
+[[ ! -d /etc/fonts ]] || args+=(--ro-bind /etc/fonts /etc/fonts)
+if [[ ${1:-} == --nvenc || ${1:-} == --nvidia-renderer ]]; then
+    gpu_mode=$1
+    shift
+    shopt -s nullglob
+    devices=(/dev/nvidia*)
+    if [[ ${#devices[@]} == 0 ]]; then
+        echo 'NVENC test requested but no /dev/nvidia* devices exist' >&2
+        exit 1
+    fi
+    for device in "${devices[@]}"; do
+        [[ -c "$device" || -d "$device" ]] || continue
+        args+=(--dev-bind "$device" "$device")
+    done
+    # CUDA discovers NVIDIA PCI devices through sysfs even though the
+    # compositor stays on llvmpipe. Driver metadata is read-only.
+    args+=(--ro-bind /sys /sys)
+    args+=(--setenv KDE_RDP_LAB_NVENC 1)
+    if [[ $gpu_mode == --nvidia-renderer ]]; then
+        # Render nodes support GPU commands without modesetting/DRM master.
+        # Never expose /dev/dri/card*, physical input or a local desktop socket.
+        for device in /dev/dri/renderD*; do
+            [[ -c "$device" ]] || continue
+            args+=(--dev-bind "$device" "$device")
+        done
+        args+=(--unsetenv LIBGL_ALWAYS_SOFTWARE --unsetenv GALLIUM_DRIVER
+               --setenv KDE_RDP_RENDERER hardware
+               --setenv KDE_RDP_LAB_NVIDIA_RENDERER 1)
+    fi
+fi
+if [[ ${1:-} == --input-method-startup ]]; then
+    shift
+    args+=(--ro-bind "$repo/broker/config/session-autostart" /usr/lib/kde-rdp/session-autostart
+           --ro-bind "$repo/broker/config/session-input-method" /usr/lib/kde-rdp/session-input-method
+           --setenv KDE_RDP_LAB_INPUT_METHOD_STARTUP 1)
+fi
+exec bwrap "${args[@]}" /usr/bin/bash -c 'mkdir -m 700 /tmp/kde-rdp-runtime; exec "$@"' bash "$@"

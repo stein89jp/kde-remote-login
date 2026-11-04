@@ -1,0 +1,2 @@
+u kde-rdp - "KDE RDP frontend" /var/empty /usr/bin/nologin
+g kde-rdp-users -

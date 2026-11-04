@@ -1,0 +1,62 @@
+[Unit]
+Description=KDE RDP login frontend
+Requires=kde-rdp-broker.service
+# Niri-RDP's frontend listens on the same TCP port (33991): only one of the
+# two can run at a time.
+Conflicts=niri-rdp-frontend.service
+# Prepare headless NVIDIA hosts on every start, including with older /etc
+# encoder overrides. Bitmap hosts can still start if NVIDIA preparation fails.
+Wants=kde-rdp-nvidia-devices.service
+After=kde-rdp-broker.service kde-rdp-nvidia-devices.service
+
+[Service]
+Type=simple
+User=kde-rdp
+Group=kde-rdp
+EnvironmentFile=/etc/kde-rdp/frontend.conf
+LoadCredential=tls-cert:/etc/kde-rdp/tls/cert.pem
+LoadCredential=tls-key:/etc/kde-rdp/tls/key.pem
+ExecStart=/usr/lib/kde-rdp/session-environment --frontend
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+# The frontend runs unprivileged on an unprivileged port and needs no
+# capabilities; drop them all, including from the bounding set.
+CapabilityBoundingSet=
+PrivateTmp=yes
+# The NVIDIA drop-in disables PrivateDevices; the device policy stays closed and
+# that drop-in allow-lists only the GPU device groups.
+PrivateDevices=yes
+DevicePolicy=closed
+# Wayland buffers, broker leases and audio use passed file descriptors and
+# memfd, not SysV IPC or POSIX message queues.
+PrivateIPC=yes
+RemoveIPC=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Invisible hides other users' processes; keep full /proc otherwise because the
+# NVIDIA driver reads /proc/driver/nvidia (do not add ProcSubset=pid).
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# MemoryDenyWriteExecute is deliberately absent: the NVIDIA driver may JIT.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Fail an unexpected system call with EPERM instead of killing every session.
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+TasksMax=64
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

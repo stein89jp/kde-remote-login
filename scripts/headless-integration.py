@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""Real Niri/app/RDP test; run inside lab/run-isolated.sh, never a host desktop."""
+import json
+import os
+import re
+from pathlib import Path
+import secrets
+import selectors
+import shutil
+import signal
+import socket
+import subprocess
+import tempfile
+import time
+from mock_broker import MockBroker
+
+ROOT = Path(__file__).resolve().parents[1]
+DESKTOP_SIZES = [(1001, 701), (702, 1001), (1002, 701), (702, 1001)]
+
+
+def wait_for(path, process):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"child exited before readiness: {process.returncode}")
+        if path.exists():
+            return
+        time.sleep(0.05)
+    raise RuntimeError("private compositor socket startup timed out")
+
+
+def stop(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+
+def native_output_size(ipc_path):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(2)
+        connection.connect(str(ipc_path))
+        connection.sendall(b'"Outputs"\n')
+        with connection.makefile("rb") as reply:
+            outputs = json.loads(reply.readline())["Ok"]["Outputs"]
+    output = outputs["HEADLESS-1"]
+    mode = output["modes"][output["current_mode"]]
+    logical = output["logical"]
+    return (mode["width"], mode["height"]), (logical["width"], logical["height"])
+
+
+def resize_roundtrip(environment, ipc_path, log_path):
+    """Hold each decoded size until IPC confirms the native compositor mode."""
+    decoded_sizes = []
+    output = []
+    with log_path.open("w+") as error_log:
+        process = subprocess.Popen([str(ROOT / "artifacts/rdp-desktop-client")],
+                                   env=dict(environment, KDE_RDP_TEST_RESIZE_ACK="1"),
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=error_log, text=True, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 25
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("dynamic resolution client timed out")
+                    if not selector.select(timeout=0.1):
+                        continue
+                    line = process.stdout.readline()
+                    if not line:
+                        break
+                    output.append(line)
+                    if line.startswith("KDE_RDP_DESKTOP_SIZE "):
+                        size = tuple(map(int, line.split()[1:]))
+                        expected = DESKTOP_SIZES[len(decoded_sizes)]
+                        if size != expected:
+                            raise RuntimeError(f"decoded desktop size {size}, expected {expected}")
+                        native, logical = native_output_size(ipc_path)
+                        if native != size or logical != size:
+                            raise RuntimeError(f"decoded {size} but native output={native}, logical={logical}")
+                        decoded_sizes.append(size)
+                        process.stdin.write("continue\n")
+                        process.stdin.flush()
+            result = process.wait(timeout=3)
+            error_log.flush()
+            error_log.seek(0)
+            errors = error_log.read()
+            rendered = "".join(output)
+            if result or decoded_sizes != DESKTOP_SIZES or "KDE_RDP_DYNAMIC_RESOLUTION_OK" not in rendered:
+                raise RuntimeError(f"dynamic resolution roundtrip failed: rc={result}, sizes={decoded_sizes} "
+                                   f"{rendered} {errors}")
+            return subprocess.CompletedProcess(process.args, result, rendered, errors)
+        finally:
+            stop(process)
+            process.stdin.close()
+            process.stdout.close()
+            error_log.flush()
+            error_log.seek(0)
+            errors = error_log.read()
+            log_path.write_text("".join(output) + errors)
+
+
+def fcitx_environment(environment, runtime, private, launch, bus_log="ime-bus.log"):
+    """Configure a disposable user's profile and isolated bus."""
+    bus_path = runtime / "ime-bus"
+    bus = launch(["/usr/bin/dbus-daemon", "--session", "--nofork", "--nopidfile",
+                  "--address=unix:path=" + str(bus_path)], environment, bus_log)
+    wait_for(bus_path, bus)
+    config = private / "config"
+    profile = config / "fcitx5/profile"
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text("[Groups/0]\nName=Default\nDefault Layout=jp\nDefaultIM=mozc\n"
+                       "[Groups/0/Items/0]\nName=keyboard-jp\n"
+                       "[Groups/0/Items/1]\nName=mozc\n[GroupOrder]\n0=Default\n")
+    environment = dict(environment, KDE_RDP_RUNTIME_DIR=str(runtime),
+                       XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="wayland-0",
+                       DBUS_SESSION_BUS_ADDRESS="unix:path=" + str(bus_path),
+                       XDG_CONFIG_HOME=str(config), INPUT_METHOD="fcitx", QT_IM_MODULE="fcitx")
+    return environment
+
+
+def start_fcitx(environment, runtime, private, launch):
+    """Use the production profile snapshot on a disposable private bus."""
+    environment = fcitx_environment(environment, runtime, private, launch)
+    # Keep the daemon in a tracked child group even after this helper exits.
+    helper = launch(["/usr/bin/python3", "-c",
+                     "import os, importlib.util; from importlib.machinery import SourceFileLoader; "
+                     "loader=SourceFileLoader('input_method', '/work/broker/config/session-input-method'); "
+                     "helper=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader)); "
+                     "loader.exec_module(helper); "
+                     "helper.start(os.environ)"], environment, "fcitx.log")
+    if helper.wait(timeout=10):
+        raise RuntimeError("private Fcitx profile startup failed")
+    copied = runtime / "input-method-config/fcitx5/profile"
+    if not copied.exists() or copied.read_bytes() != (private / "config/fcitx5/profile").read_bytes():
+        raise RuntimeError("Fcitx did not inherit the disposable configured profile")
+    for arguments in (["-s", "mozc"], ["-c"]):
+        subprocess.run(["/usr/bin/fcitx5-remote", *arguments], env=environment,
+                       check=True, capture_output=True, timeout=5)
+    return environment
+
+
+def require_fcitx(environment):
+    current = subprocess.run(["/usr/bin/fcitx5-remote", "-n"], env=environment,
+                             check=True, capture_output=True, text=True, timeout=5)
+    if not current.stdout.strip():
+        raise RuntimeError("Fcitx lost its private bus name during remote input")
+
+
+def main():
+    gpu_rendering = os.environ.get("KDE_RDP_LAB_NVIDIA_RENDERER") == "1"
+    fcitx = os.environ.get("KDE_RDP_LAB_FCITX") == "1"
+    if fcitx and (not shutil.which("fcitx5") or not shutil.which("fcitx5-remote") or
+                  not Path("/usr/share/fcitx5/inputmethod/mozc.conf").exists()):
+        raise RuntimeError("the opt-in IME check requires Fcitx5 and its Mozc addon")
+    dri = Path("/dev/dri")
+    if dri.exists():
+        if not gpu_rendering or any(
+            entry.is_symlink() or not entry.is_char_device() or
+            not (entry.name.startswith("renderD") and entry.name[7:].isdigit())
+            for entry in dri.iterdir()
+        ):
+            raise RuntimeError("DRM access must contain only render nodes in explicit NVIDIA renderer mode")
+    if (ROOT != Path("/work") or
+            Path("/dev/input").exists() or os.environ.get("DISPLAY")):
+        raise RuntimeError("run only inside lab/run-isolated.sh with private devices")
+    if fcitx:
+        # D-Bus and Mozc need a name for this namespace's unprivileged UID.
+        # /etc is disposable; no host account database is mounted here.
+        if Path("/etc/passwd").exists():
+            raise RuntimeError("IME integration requires a disposable account database")
+        Path("/etc/passwd").write_text(
+            f"test:x:{os.getuid()}:{os.getgid()}:Disposable test:/home/test:/bin/sh\n")
+        Path("/etc/group").write_text(f"test:x:{os.getgid()}:\n")
+        Path("/etc/nsswitch.conf").write_text("passwd: files\ngroup: files\n")
+    runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    encoder = os.environ.get("KDE_RDP_LAB_ENCODER", "bitmap")
+    if encoder not in ("bitmap", "nvenc"):
+        raise RuntimeError("KDE_RDP_LAB_ENCODER must be bitmap or nvenc")
+    if encoder == "nvenc" and os.environ.get("KDE_RDP_LAB_NVENC") != "1":
+        raise RuntimeError("NVENC integration requires lab/run-isolated.sh --nvenc or --nvidia-renderer")
+    gfx_setting = os.environ.get("KDE_RDP_LAB_GFX", "1")
+    if gfx_setting not in ("0", "1"):
+        raise RuntimeError("KDE_RDP_LAB_GFX must be 0 or 1")
+    gfx = encoder == "nvenc" and gfx_setting == "1"
+    username = "disposable-" + secrets.token_hex(8)
+    # The login client types physical JIS scancodes, including punctuation
+    # which differs from US. Only the namespace's fake broker sees this secret.
+    password = secrets.token_hex(24) + '@"^&:[]'
+    tls_contract = os.environ.get("KDE_RDP_LAB_TLS_CONTRACT") == "1"
+    login_screen = os.environ.get("KDE_RDP_LAB_LOGIN_SCREEN") == "1"
+    if login_screen and not tls_contract:
+        raise RuntimeError("KDE_RDP_LAB_LOGIN_SCREEN requires KDE_RDP_LAB_TLS_CONTRACT=1")
+    # The namespace supplies only these explicit environment values.
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "XDG_RUNTIME_DIR", "LD_LIBRARY_PATH",
+                                    "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER", "XKB_CONFIG_ROOT",
+                                    "KDE_RDP_RENDERER", "XKB_DEFAULT_RULES", "XKB_DEFAULT_MODEL",
+                                    "XKB_DEFAULT_LAYOUT", "XKB_DEFAULT_VARIANT", "XKB_DEFAULT_OPTIONS")
+           if k in os.environ}
+    # The restricted form cannot read a compositor keymap before login. Give
+    # it the same JIS defaults as lab/headless.kdl and the fixture's scancodes.
+    env.update(XKB_DEFAULT_RULES="evdev", XKB_DEFAULT_MODEL="jp106",
+               XKB_DEFAULT_LAYOUT="jp", XKB_DEFAULT_VARIANT="", XKB_DEFAULT_OPTIONS="")
+    env["NIRI_BACKEND"] = "headless"
+    with socket.socket() as port:
+        port.bind(("127.0.0.1", 33991))
+    children = []
+    results = {}
+    with tempfile.TemporaryDirectory(prefix="niri-real-integration-", dir="/tmp") as folder:
+        private = Path(folder)
+        subprocess.run(["openssl", "req", "-config", "/dev/null", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-subj", "/CN=localhost", "-keyout", str(private / "key.pem"),
+                        "-out", str(private / "cert.pem")], check=True, capture_output=True)
+        (private / "key.pem").chmod(0o600)
+        logs = []
+
+        def launch(argv, environment, name):
+            log = (private / name).open("w+")
+            logs.append(log)
+            proc = subprocess.Popen(argv, env=environment, stdout=log, stderr=log, start_new_session=True)
+            children.append(proc)
+            return proc
+
+        try:
+            niri = launch([str(ROOT / os.environ.get("KDE_RDP_LAB_NIRI", "compositor/upstream/target/debug/niri")),
+                           "--config", str(ROOT / "lab/headless.kdl")], env, "niri.log")
+            wait_for(runtime / "wayland-0", niri)
+            ipc_path = runtime / f"niri.wayland-0.{niri.pid}.sock"
+            wait_for(ipc_path, niri)
+            if os.environ.get("KDE_RDP_LAB_NVIDIA_RENDERER") == "1":
+                # Wayland/IPC sockets are created before EGL initialization.
+                # Wait for the renderer rather than treating socket creation as
+                # evidence that GPU startup has already finished.
+                deadline = time.monotonic() + 15
+                while True:
+                    renderer_log = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", (private / "niri.log").read_text())
+                    if all(marker in renderer_log for marker in (
+                        "headless renderer: hardware EGL device", "nvidia=true",
+                        "headless renderer: advertised hardware DMA-BUF formats",
+                    )):
+                        break
+                    if niri.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("requested NVIDIA renderer and DMA-BUF support were not confirmed")
+                    time.sleep(0.05)
+                results["nvidia_renderer"] = "hardware EGL device and application DMA-BUF formats confirmed"
+            app_env = dict(env, WAYLAND_DISPLAY="wayland-0")
+            if fcitx:
+                app_env["KDE_RDP_TEST_IME"] = "1"
+            app = launch([str(ROOT / "lab/dynamic-app")], app_env, "app.log")
+            time.sleep(1)
+            bridge_env = dict(env, KDE_RDP_MODE="disposable", KDE_RDP_CERT=str(private / "cert.pem"),
+                              KDE_RDP_KEY=str(private / "key.pem"), KDE_RDP_USERNAME=username,
+                              KDE_RDP_PASSWORD=password, KDE_RDP_WAYLAND_SOCKET=str(runtime / "wayland-0"))
+            bridge_env["KDE_RDP_ENCODER"] = encoder
+            if fps := os.environ.get("KDE_RDP_LAB_FPS"):
+                bridge_env["KDE_RDP_FPS"] = fps
+            for setting in ("VIDEO_CODEC", "GPU_CAPTURE", "ADAPTIVE_GRAPHICS", "VIDEO_PROFILE", "SCALE", "DIAGNOSTICS", "LINK_MBPS"):
+                if value := os.environ.get("KDE_RDP_LAB_" + setting):
+                    bridge_env["KDE_RDP_" + setting] = value
+            fixture = None
+            if tls_contract:
+                fixture = MockBroker(runtime, username, password)
+                bridge_env["KDE_RDP_MODE"] = "broker"
+                bridge_env.pop("KDE_RDP_USERNAME")
+                bridge_env.pop("KDE_RDP_PASSWORD")
+                bridge_env.pop("KDE_RDP_WAYLAND_SOCKET")
+            bridge = launch([str(ROOT / os.environ.get("KDE_RDP_LAB_BRIDGE", "bridge/target/debug/kde-rdp-bridge"))], bridge_env, "bridge.log")
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if bridge.poll() is not None:
+                    raise RuntimeError("bridge exited at startup")
+                try:
+                    with socket.create_connection(("127.0.0.1", 33991), timeout=0.1):
+                        break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                raise RuntimeError("bridge startup timed out")
+            client_env = dict(env, WLOG_LEVEL=os.environ.get("KDE_RDP_LAB_WLOG", "OFF"), KDE_RDP_TEST_NLA="1",
+                              KDE_RDP_TEST_USERNAME=username, KDE_RDP_TEST_PASSWORD=password,
+                              KDE_RDP_TEST_KEYBOARD="1")
+            if tls_contract:
+                client_env.pop("KDE_RDP_TEST_NLA")
+            if gfx:
+                client_env["KDE_RDP_TEST_GFX"] = "1"
+            avc444 = gfx and os.environ.get("KDE_RDP_LAB_VIDEO_CODEC") in ("auto", "avc444")
+            if avc444:
+                client_env["KDE_RDP_TEST_AVC444"] = "1"
+            bad = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")],
+                                 env=dict(client_env, KDE_RDP_TEST_PASSWORD=secrets.token_hex(24)),
+                                 capture_output=True, text=True, timeout=25)
+            (private / "client-rejected.log").write_text(bad.stdout + bad.stderr)
+            # TLS-only validation rejection currently appears as a transport
+            # failure in FreeRDP. Require positive broker rejection evidence,
+            # rather than accepting any failed connection as an auth test.
+            rejected = (fixture.rejected >= 1 and fixture.accepted == 0 and bad.returncode != 0) if fixture else (
+                bad.returncode == 4 and "RDP_AUTHENTICATION_REJECTED" in bad.stdout)
+            if not rejected:
+                if fixture:
+                    print(f"test broker counters: rejected={fixture.rejected}, accepted={fixture.accepted}, closed={fixture.closed}")
+                raise RuntimeError(f"wrong-password rejection failed: rc={bad.returncode} {bad.stderr}")
+            results["wrong_disposable_credentials"] = "passed"
+            # FreeRDP retries the rejected login once; wait out the frontend's
+            # per-source backoff so the next good client is not throttled.
+            time.sleep(1.5)
+            if login_screen:
+                client_env["KDE_RDP_TEST_LOGIN_SCREEN"] = "1"
+            for i in range(2):
+                good = resize_roundtrip(client_env, ipc_path, private / f"client-{i+1}.log")
+                if good.returncode or "KDE_RDP_APP_KEY_POINTER_RELEASE_OK" not in good.stdout:
+                    raise RuntimeError(f"real desktop RDP roundtrip {i} failed: rc={good.returncode} "
+                                       f"{good.stdout} {good.stderr}")
+                codec_marker = "KDE_RDP_AVC444_DECODED_STREAMS" if avc444 else "KDE_RDP_AVC420_DECODED_FRAMES"
+                if gfx and not re.search(rf"{codec_marker} [1-9][0-9]*", good.stdout):
+                    raise RuntimeError("NVENC roundtrip did not decode the requested negotiated codec")
+                if login_screen:
+                    for marker in ("KDE_RDP_LOGIN_SCREEN_WITHOUT_CLIENT_CREDENTIALS",
+                                   "KDE_RDP_LOGIN_SCREEN_WRONG_PASSWORD_REJECTED",
+                                   "KDE_RDP_LOGIN_SCREEN_PAM_BINDING_OK"):
+                        if marker not in good.stdout:
+                            raise RuntimeError(f"login screen roundtrip missing {marker}")
+                results[f"real_desktop_roundtrip_{i+1}"] = "passed"
+                time.sleep(0.3)
+            results["client_initial_resolution_native_output_and_decoded_frame"] = "passed"
+            results["live_disp_portrait_landscape_odd_height_native_output_decode_input"] = "passed"
+            log = (private / "app.log").read_text()
+            for event in ("KEY 30 1", "KEY 30 0", "BUTTON 272 1", "BUTTON 272 0", "MOTION"):
+                if event not in log:
+                    raise RuntimeError(f"Wayland app did not acknowledge {event}")
+            if "FRAME" not in log:
+                raise RuntimeError("animated app did not reach frame callback checkpoint")
+            if "XKB_TEXT abc123ABc" not in log or "KEYSYM 65293" not in log:
+                raise RuntimeError("remote consecutive text, Shift release or Enter did not decode with the client's XKB map")
+            if not Path("/tmp/kde-rdp-meta-d-proof").exists():
+                raise RuntimeError("remote Meta+D did not reach Niri's compositor keybindings")
+            results["decoded_consecutive_text_shift_release_enter_and_meta_d_bind"] = "passed"
+            for text in ['@"^&:[]\\\\', 'Phone@"日本😀Aa@']:
+                if f"XKB_TEXT {text}" not in log:
+                    raise RuntimeError(f"JIS/phone input did not arrive unchanged: {text!r}")
+            for key in (93, 92, 94):
+                for state in (1, 0):
+                    if f"KEY {key} {state}" not in log:
+                        raise RuntimeError(f"Japanese conversion key did not arrive: {key} {state}")
+            results["jp106_punctuation_ro_yen_and_phone_unicode_surrogate_shift_roundtrip"] = "passed"
+            results["wayland_application_events_and_animation"] = "passed"
+            if fcitx:
+                ime_env = start_fcitx(env, runtime, private, launch)
+                forward_offset = (private / "app.log").stat().st_size
+                forwarded = resize_roundtrip(client_env, ipc_path, private / "client-fcitx-forwarded.log")
+                if forwarded.returncode or "KDE_RDP_APP_KEY_POINTER_RELEASE_OK" not in forwarded.stdout:
+                    raise RuntimeError("Fcitx did not forward ordinary RDP keys")
+                forwarded_log = (private / "app.log").read_bytes()[forward_offset:].decode()
+                for text in ["abc123ABc", '@"^&:[]\\\\', 'Phone@"日本😀Aa@']:
+                    if f"XKB_TEXT {text}" not in forwarded_log:
+                        raise RuntimeError(f"Fcitx changed forwarded text or committed Unicode: {text!r}")
+                require_fcitx(ime_env)
+                composed = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")],
+                                          env=dict(client_env, KDE_RDP_TEST_IME="1"),
+                                          capture_output=True, text=True, timeout=25)
+                (private / "client-fcitx-compose.log").write_text(composed.stdout + composed.stderr)
+                if composed.returncode or "KDE_RDP_IME_SEQUENCE_SENT" not in composed.stdout:
+                    raise RuntimeError("RDP Japanese composition sequence failed")
+                deadline = time.monotonic() + 5
+                while not all(text in (private / "app.log").read_text()
+                              for text in ("IME_COMMIT 日本", "IME_COMMIT ニホン", 'XKB_TEXT U@日本😀')):
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Fcitx/Mozc Japanese, Katakana or committed Unicode input failed")
+                    time.sleep(0.05)
+                require_fcitx(ime_env)
+                subprocess.run(["/usr/bin/fcitx5-remote", "-c"], env=ime_env,
+                               check=True, capture_output=True, timeout=5)
+                results["fcitx_private_profile_forwarded_keys_ctrl_space_mozc_japanese_commit"] = "passed"
+                results["fcitx_forwarded_jis_shift_and_committed_unicode"] = "passed"
+                results["fcitx_mozc_katakana_conversion_through_rdp_f7"] = "passed"
+                results["committed_unicode_with_mozc_active"] = "passed"
+            if gpu_rendering:
+                results["no_physical_input_or_drm_modesetting_or_inherited_display"] = "passed; DRM render nodes only"
+            else:
+                results["no_physical_input_or_dri_devices_or_inherited_display"] = "passed"
+            held = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")],
+                                  env=dict(client_env, KDE_RDP_TEST_HOLD="1"),
+                                  capture_output=True, text=True, timeout=25)
+            (private / "client-held.log").write_text(held.stdout + held.stderr)
+            if held.returncode:
+                raise RuntimeError(f"held-input connection failed: {held.stderr}")
+            time.sleep(0.5)
+            # A fresh connection must see the app's original color, which
+            # requires the disconnected virtual keyboard and pointer to release.
+            released = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")], env=client_env,
+                                      capture_output=True, text=True, timeout=25)
+            (private / "client-released.log").write_text(released.stdout + released.stderr)
+            if released.returncode:
+                raise RuntimeError(f"disconnect did not restore app input state: {released.stderr}")
+            results["held_key_and_button_disconnect_release"] = "passed"
+            before = (private / "app.log").read_text().count("BUTTON 272 1")
+            crashing = subprocess.Popen([str(ROOT / "artifacts/rdp-desktop-client")],
+                                        env=dict(client_env, KDE_RDP_TEST_CRASH="1"),
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                        start_new_session=True)
+            children.append(crashing)
+            deadline = time.monotonic() + 10
+            while (private / "app.log").read_text().count("BUTTON 272 1") == before:
+                if time.monotonic() >= deadline or crashing.poll() is not None:
+                    raise RuntimeError("crash test did not establish an active desktop")
+                time.sleep(0.05)
+            niri.kill()
+            niri.wait(timeout=5)
+            crash_output, crash_error = crashing.communicate(timeout=5)
+            (private / "client-crash.log").write_text(crash_output + crash_error)
+            if crashing.returncode != 2 or bridge.poll() is not None:
+                raise RuntimeError("compositor crash did not close the active RDP connection cleanly")
+            results["compositor_crash_closes_active_rdp_frontend_survives"] = "passed"
+            if fcitx and os.environ.get("KDE_RDP_LAB_INPUT_METHOD_STARTUP") == "1":
+                startup_runtime = private / "startup-runtime"
+                startup_runtime.mkdir(mode=0o700)
+                startup_env = fcitx_environment(env, startup_runtime, private, launch, "startup-bus.log")
+                startup = launch([str(ROOT / os.environ.get("KDE_RDP_LAB_NIRI", "compositor/upstream/target/debug/niri")),
+                                  "--config", str(ROOT / "lab/headless.kdl")], startup_env, "startup-niri.log")
+                wait_for(startup_runtime / "wayland-0", startup)
+                deadline = time.monotonic() + 10
+                while True:
+                    query = subprocess.run([
+                        "/usr/bin/busctl", "--address=" + startup_env["DBUS_SESSION_BUS_ADDRESS"],
+                        "--auto-start=no", "--timeout=1", "call", "org.fcitx.Fcitx5", "/controller",
+                        "org.fcitx.Fcitx.Controller1", "CurrentInputMethodGroup",
+                    ], env=startup_env, capture_output=True, text=True, timeout=2)
+                    if query.returncode == 0 and query.stdout.strip() == 's "Default"':
+                        break
+                    if startup.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("compositor startup did not prepare Fcitx while serving Wayland")
+                    time.sleep(0.05)
+                # With no focused application, CurrentInputMethod may be empty;
+                # the controller group reply proves profile and bus readiness.
+                startup_log = (private / "startup-niri.log").read_text()
+                if "startup timed out" in startup_log or "activation preparation failed" in startup_log:
+                    raise RuntimeError("compositor startup reported input-method preparation failure")
+                results["fcitx_ready_during_compositor_prepare_without_wayland_deadlock"] = "passed"
+            if encoder == "nvenc":
+                bridge_log = (private / "bridge.log").read_text()
+                if "NVENC H.264 preflight passed" not in bridge_log:
+                    raise RuntimeError("requested NVENC encoder did not pass hardware preflight")
+                # Three normal clients recreate graphics at every live layout;
+                # held-input and crash probes retain their initial desktop.
+                # Login and desktop share a graphics wrapper and the same
+                # negotiated size, so authentication reuses the login surface.
+                expected_graphics = (3 * len(DESKTOP_SIZES) + 2 +
+                                     (len(DESKTOP_SIZES) + 1 if fcitx else 0)) if gfx else 0
+                codec = "AVC444" if avc444 else "AVC420"
+                actual_graphics = bridge_log.count("RDP graphics using NVENC H.264 " + codec)
+                if actual_graphics != expected_graphics:
+                    raise RuntimeError(f"expected {expected_graphics} NVENC {codec} initializations, "
+                                       f"observed {actual_graphics}")
+                key = (f"nvenc_{codec.lower()}_graphics_real_app_decode_input_reconnect" if gfx else
+                       "nvenc_bitmap_fallback_for_client_without_graphics")
+                results[key] = "passed"
+                if os.environ.get("KDE_RDP_LAB_REQUIRE_GPU") == "1":
+                    if not gpu_rendering or not gfx or os.environ.get("KDE_RDP_LAB_GPU_CAPTURE") != "auto":
+                        raise RuntimeError("GPU capture proof requires hardware renderer, graphics client and auto capture")
+                    activations = re.findall(
+                        r"RDP GPU capture using EGL/CUDA DMA-BUF NVENC \((\d+)x(\d+)\)", bridge_log)
+                    dimensions = {tuple(map(int, dimensions)) for dimensions in activations}
+                    if not set(DESKTOP_SIZES).issubset(dimensions):
+                        raise RuntimeError(f"GPU capture did not encode every requested layout: {sorted(dimensions)}")
+                    results["gpu_dmabuf_egl_cuda_nvenc_real_decode_resize_reconnect"] = {
+                        "native_encoder_activations": len(activations),
+                        "encoded_dimensions": sorted(dimensions),
+                    }
+            if fixture:
+                deadline = time.monotonic() + 3
+                while fixture.closed != fixture.accepted and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                expected_connections = 7 if fcitx else 5
+                expected_rejections = (6 + (2 if fcitx else 0)) if login_screen else 1
+                if (fixture.rejected < expected_rejections or fixture.accepted != expected_connections or
+                        fixture.closed != expected_connections):
+                    raise RuntimeError("TLS broker FD/lease lifecycle counts do not match the RDP connections: "
+                                       f"rejected={fixture.rejected}, accepted={fixture.accepted}, closed={fixture.closed}")
+                key = ("tls_login_screen_rejection_authentication_desktop_and_lease_eof" if login_screen else
+                       "tls_clientinfo_broker_fd_binding_and_lease_eof")
+                results[key] = "passed using namespace test broker; no PAM"
+                if login_screen:
+                    results["tls_login_screen_jis_punctuation_password_scancodes"] = "passed"
+            results["pam_logind_boot_windows_monitor_off"] = "pending separate machines"
+        except Exception:
+            for log in logs:
+                log.flush()
+                log.seek(0)
+                print(f"--- {Path(log.name).name} ---\n{log.read()[-6000:]}")
+            failure = ROOT / "artifacts/integration-failures" / secrets.token_hex(6)
+            failure.mkdir(parents=True)
+            for path in private.glob("*.log"):
+                shutil.copy2(path, failure / path.name)
+            print(f"Complete failure logs preserved in {failure}")
+            raise
+        finally:
+            for proc in reversed(children):
+                stop(proc)
+            for log in logs:
+                log.close()
+            if evidence := os.environ.get("KDE_RDP_LAB_EVIDENCE"):
+                destination = Path(evidence).resolve()
+                if not destination.is_relative_to(ROOT / "artifacts"):
+                    raise RuntimeError("integration evidence must stay under artifacts/")
+                destination.mkdir(parents=True, exist_ok=True)
+                for path in private.glob("*.log"):
+                    shutil.copy2(path, destination / path.name)
+        rendered = json.dumps(results, indent=2) + "\n"
+        if report := os.environ.get("KDE_RDP_LAB_REPORT"):
+            Path(report).write_text(rendered)
+        print(rendered)
+
+
+if __name__ == "__main__":
+    main()

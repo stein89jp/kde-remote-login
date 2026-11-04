@@ -1,0 +1,74 @@
+#!/usr/bin/python3
+"""Give the private bus the remote display and start its configured portal."""
+import os
+from pathlib import Path
+import subprocess
+import time
+
+
+def bus_owner(name, environment, timeout=2):
+    result = subprocess.run([
+        "/usr/bin/busctl", "--address=" + environment["DBUS_SESSION_BUS_ADDRESS"],
+        "--timeout=" + str(timeout), "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "GetNameOwner", "s", name,
+    ], env=environment, capture_output=True, text=True, timeout=timeout)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def replace_stale_backends(environment):
+    # session-plasma exports the display before anything else runs, so the KDE
+    # backend is activated with it. A GTK or GNOME backend (used by the host's
+    # configuration for some interfaces) may still have been activated early;
+    # both support --replace. GNOME exposes Settings only when display
+    # initialization fails. Checking ownership does not activate unused
+    # backends or affect host routing.
+    for backend in ("gnome", "gtk"):
+        name = "org.freedesktop.impl.portal.desktop." + backend
+        executable = "/usr/lib/xdg-desktop-portal-" + backend
+        owner = bus_owner(name, environment)
+        if owner is None or not Path(executable).is_file():
+            continue
+        process = subprocess.Popen([executable, "--replace"], env=environment)
+        deadline = time.monotonic() + 5
+        while (remaining := deadline - time.monotonic()) > 0:
+            replacement = bus_owner(name, environment, timeout=min(2, remaining))
+            if replacement is not None and replacement != owner:
+                break
+            if process.poll() is not None:
+                raise RuntimeError("private " + backend + " portal replacement exited")
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("private " + backend + " portal replacement timed out")
+
+
+def main():
+    # Run by session-plasma under KWin: the compositor's socket now exists. Never
+    # import this environment into the shared systemd user manager or the
+    # physical desktop.
+    runtime = os.environ["KDE_RDP_RUNTIME_DIR"]
+    if os.environ.get("XDG_RUNTIME_DIR") != runtime:
+        raise RuntimeError("portal startup requires the private runtime")
+    if not os.environ.get("WAYLAND_DISPLAY") or not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        raise RuntimeError("portal startup requires KWin's display and private bus")
+    # The private bus keeps XDG_CURRENT_DESKTOP=KDE for every activated service.
+    # Only this frontend also lists kde-rdp: it prefers the host's
+    # kde-portals.conf (plasma-workspace) and falls back to kde-rdp-portals.conf.
+    environment = dict(os.environ, XDG_CURRENT_DESKTOP="KDE:kde-rdp")
+    activation = dict(environment, XDG_CURRENT_DESKTOP="KDE")
+    variables = ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY",
+                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
+                 "KDE_FULL_SESSION", "KDE_SESSION_VERSION",
+                 "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE", "PULSE_SERVER")
+    subprocess.run(["/usr/bin/dbus-update-activation-environment",
+                    *(key + "=" + activation.get(key, "") for key in variables),
+                    *(key + "=" + activation[key] for key in
+                      ("XMODIFIERS", "QT_IM_MODULE", "GTK_IM_MODULE") if key in activation)],
+                   env=environment, check=True)
+    replace_stale_backends(environment)
+    # Replace a frontend activated before the display was exported. Later
+    # activation keeps the same host-first backend selection.
+    os.execve("/usr/lib/xdg-desktop-portal", ["xdg-desktop-portal", "--replace"], environment)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,97 @@
+# Python caches, test reports, and local virtual environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# Rust build output and repository-local dependency caches.
+target/
+.cargo-cache/
+/compositor/cargo-home/
+
+# Native build output.
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.rlib
+*.rmeta
+/bridge/build/
+/broker/build/
+/broker/kde-rdp-broker
+/broker/broker-tests
+
+# Disposable upstream checkouts, lab fixtures, and validation evidence.
+/compositor/upstream/
+/compositor/rebase-work/
+/lab/sysroot/
+/lab/results/
+/lab/downloads/
+/lab/generated/
+/lab/dynamic-app
+/research/results/
+/artifacts/
+# Release downloads are staged locally; publish distributable files as Release assets.
+/releases/
+
+# makepkg products for every Arch recipe; preserve source/release archives elsewhere.
+/packaging/arch/*/src/
+/packaging/arch/*/pkg/
+/packaging/arch/*/repo-*
+/packaging/arch/*/*.tar.*
+/packaging/arch/*/SHA256SUMS
+/packaging/arch/*/SHA256SUMS.sig
+
+# Local runtime identities and environment files; examples may be committed.
+/poc/private/
+/private/
+/tls/
+/.aws/
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Temporary files, logs, editor backups, and desktop metadata.
+/tmp/
+/temp/
+/.cache/
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
+.*.swp
+.*.swo
+.*.swx
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+PLAN.md
+PLAN2.md
+PLAN3.md
+
+# Niri source archives are downloaded and hash-checked by makepkg (pins.json);
+# research/upstream checkouts are superseded by bridge/vendor and the pins.
+/compositor/niri-*.tar.gz
+/research/upstream/*
+!/research/upstream/manifest.json
+lab/kwin/out/
+
+# Local assistant instructions are kept out of the public repository.
+CLAUDE.md

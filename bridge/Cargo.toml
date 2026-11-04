@@ -1,0 +1,44 @@
+[package]
+name = "kde-rdp-bridge"
+version = "0.1.0" # Not the package version; see docs/upgrade.md#release-history.
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+# Already locked through IronRDP; zero-copy capture snapshots wrap SHM slots.
+bytes = "1"
+ironrdp-server = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", default-features = false, features = ["helper", "egfx"] }
+ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+# MS-RDPEAI microphone: same pin as the vendored server; the client side drives wire tests.
+ironrdp-rdpeai = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+tokio = { version = "1", features = ["macros", "rt", "time", "signal", "sync"] }
+wayland-client = "=0.31.14"
+wayland-protocols = { version = "=0.32.13", features = ["client", "staging", "unstable"] }
+wayland-scanner = "=0.31.11"
+# Generated KDE protocol bindings (src/wayland/protocols.rs) use bitfield enums.
+bitflags = "2"
+tempfile = "=3.20.0"
+xkbcommon = "=0.9.0"
+libc = "0.2"
+miniz_oxide = "0.9"
+
+[dev-dependencies]
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44" }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+# Maintained server support; every upstream protocol crate keeps the exact pin.
+[patch."https://github.com/Devolutions/IronRDP"]
+ironrdp-server = { path = "vendor/ironrdp-server" }

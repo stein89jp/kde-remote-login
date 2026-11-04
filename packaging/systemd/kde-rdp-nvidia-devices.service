@@ -1,0 +1,23 @@
+[Unit]
+Description=Prepare NVIDIA device nodes for KDE RDP
+# Remote KWin sessions (started by the broker) render on the NVIDIA render
+# node and need /dev/nvidia*; the NVENC frontend needs them too.
+Before=kde-rdp-broker.service kde-rdp-frontend.service
+ConditionPathExists=/usr/bin/nvidia-modprobe
+ConditionPathExistsGlob=/proc/driver/nvidia/gpus/*/information
+
+[Service]
+Type=oneshot
+# Run as root before the hardened frontend: NoNewPrivileges prevents that
+# service from using nvidia-modprobe's setuid fallback to create missing nodes.
+# Each node requires an explicit minor: -c 0 creates only /dev/nvidia0;
+# -c 255 creates /dev/nvidiactl. UVM also needs -c 0 to create its two nodes;
+# -u alone only loads the module. Keep base and UVM requests separate.
+ExecStart=/usr/bin/nvidia-modprobe -c 0 -c 255
+ExecStart=/usr/bin/nvidia-modprobe -u -c 0
+# KWin's GBM/EGL on the nvidia-drm render node also opens /dev/nvidia-modeset.
+ExecStart=/usr/bin/nvidia-modprobe -m
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

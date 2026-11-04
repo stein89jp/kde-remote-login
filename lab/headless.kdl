@@ -1,0 +1,22 @@
+output "HEADLESS-1" {
+    scale 1
+    transform "normal"
+    position x=0 y=0
+}
+input {
+    keyboard {
+        xkb {
+            model "jp106"
+            layout "jp"
+        }
+    }
+    focus-follows-mouse
+}
+layout {
+    default-column-width { proportion 1.0; }
+    background-color "#203040"
+}
+
+binds {
+    Mod+D { spawn "/usr/bin/touch" "/tmp/kde-rdp-meta-d-proof"; }
+}
