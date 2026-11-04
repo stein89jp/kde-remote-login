@@ -64,14 +64,23 @@ kde-rdp-broker (root; PAM, logind, per-UID lock)
   `XDG_RUNTIME_DIR` and creates scopes through the user manager, so with the
   private values it would start a second, empty namespace. `session-worker`
   puts `/usr/lib/kde-rdp/containers` first on `PATH`; its `podman`, `buildah`,
-  `distrobox`, `distrobox-enter`, `toolbox` and `docker` links run
-  `session-containers`, which, only when the private runtime is in effect and
-  `/run/user/UID` is owned by the account, sets `XDG_RUNTIME_DIR` and
-  `DBUS_SESSION_BUS_ADDRESS` to `/run/user/UID` and its `bus`, rewrites a
-  `DOCKER_HOST` pointing at the private `docker.sock`, drops itself from `PATH`
-  and execs the real tool. The desktop itself keeps its private runtime and
-  bus. Tools called by absolute path, such as distrobox-exported launchers,
-  still forward the private runtime into the container.
+  `toolbox` and `docker` links run `session-containers`, which, only when the
+  private runtime is in effect and `/run/user/UID` is owned by the account,
+  sets `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` to `/run/user/UID` and
+  its `bus`, rewrites a `DOCKER_HOST` pointing at the private `docker.sock`,
+  drops itself from `PATH` and execs the real tool. The desktop itself keeps its
+  private runtime and bus. distrobox is not linked: it forwards its whole
+  environment into the container, and its podman calls (also from exported
+  launchers running `/usr/bin/distrobox-enter`) resolve to the podman link.
+  For podman `exec`, `run` and `create`, the shim rewrites `-e`/`--env` values
+  between the subcommand and the container or image name that equal or lie
+  under the private runtime (also as `unix:`, `unix:path=` or `unix://`
+  addresses) to the same path below `/run/host`, the host root inside distrobox
+  and toolbox containers, so Wayland, PipeWire and Pulse reach the remote
+  desktop; the private bus and X11 sockets are in `/tmp`, which distrobox
+  shares. For toolbox the shim keeps the desktop's bus and its own directory on
+  `PATH` (toolbox's podman calls come back through it) and makes a relative
+  `WAYLAND_DISPLAY` absolute so it is rewritten too (untested).
 - `session-worker` writes a session-only `XDG_CONFIG_DIRS` overlay that
   disables KWin's shake-cursor effect. That effect paints an enlarged cursor
   into screencast frames and hides the cursor metadata. The account's

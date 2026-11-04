@@ -10,19 +10,27 @@
 # file"), and exec into the user manager's cgroups is refused.
 #
 # session-worker puts /usr/lib/kde-rdp/containers first on PATH. Each name
-# there (podman, buildah, distrobox, distrobox-enter, toolbox, docker) is a
-# link to this script, which runs the real tool with the account's genuine
-# logind runtime (/run/user/UID) and systemd user bus, exactly what an SSH or
-# local login uses. Only the container tool sees these values: the desktop
-# keeps its private runtime and bus. Outside a KDE-RDP desktop, or when
-# /run/user/UID is missing or not owned by the account, nothing is changed.
+# there (podman, buildah, toolbox, docker) is a link to this script, which
+# runs the real tool with the account's genuine logind runtime (/run/user/UID)
+# and systemd user bus, exactly what an SSH or local login uses. Only the
+# container tool sees these values: the desktop keeps its private runtime and
+# bus. Outside a KDE-RDP desktop, or when /run/user/UID is missing or not owned
+# by the account, nothing is changed.
+#
+# distrobox is deliberately not linked: it forwards its whole environment into
+# the container, so it must keep the desktop's own values, and its podman calls
+# come back here through PATH (also from exported launchers that run
+# /usr/bin/distrobox-enter directly). The private runtime does not exist at its
+# own path inside a container, but the host root is mounted at /run/host, so
+# podman's exec, run and create get the desktop's sockets (Wayland, PipeWire,
+# Pulse) through /run/host (see rewrite_env below).
 set -f
 shim_dir=/usr/lib/kde-rdp/containers
 user_runtime_root=/run/user
 name=${0##*/}
 
-# Drop this directory from PATH so the real tool, and everything it runs,
-# never re-enters the shim. Empty PATH entries (the current directory) go too.
+# Drop this directory from PATH so the real tool never finds the shim again.
+# Empty PATH entries (the current directory) go too.
 clean_path=
 old_ifs=$IFS
 IFS=:
@@ -30,16 +38,40 @@ for entry in ${PATH-}; do
     [ -n "$entry" ] && [ "$entry" != "$shim_dir" ] && clean_path=${clean_path:+$clean_path:}$entry
 done
 IFS=$old_ifs
-PATH=$clean_path
-export PATH
 
+# Point an environment argument NAME=VALUE whose value is a path, unix:path=,
+# unix: or unix:// address under the private runtime at the same path below
+# /run/host. Only the exact runtime directory or a path inside it matches.
+rewrite_env() {
+    rewritten=$1
+    case $1 in *=*) ;; *) return ;; esac
+    key=${1%%=*}
+    value=${1#*=}
+    case $value in
+        unix:path=*) scheme=unix:path= ;;
+        unix://*) scheme=unix:// ;;
+        unix:*) scheme=unix: ;;
+        *) scheme= ;;
+    esac
+    rest=${value#"$scheme"}
+    case $rest in
+        "$private" | "$private"/*) rewritten="$key=$scheme/run/host$rest" ;;
+    esac
+}
+
+adopted=
 private=${KDE_RDP_RUNTIME_DIR-}
-if [ -n "$private" ] && [ "${XDG_RUNTIME_DIR-}" = "$private" ]; then
+if [ -n "$private" ]; then
     host="$user_runtime_root/$(id -u)"
-    if [ -d "$host" ] && [ -O "$host" ]; then
+    # The account's runtime is also accepted, for podman run by toolbox below.
+    if { [ "${XDG_RUNTIME_DIR-}" = "$private" ] || [ "${XDG_RUNTIME_DIR-}" = "$host" ]; } &&
+        [ -d "$host" ] && [ -O "$host" ]; then
+        adopted=1
         XDG_RUNTIME_DIR=$host
         export XDG_RUNTIME_DIR
-        if [ -S "$host/bus" ]; then
+        # toolbox only runs podman, which comes back here for the user bus;
+        # the session bus it forwards into the container stays the desktop's.
+        if [ "$name" != toolbox ] && [ -S "$host/bus" ]; then
             DBUS_SESSION_BUS_ADDRESS="unix:path=$host/bus"
             export DBUS_SESSION_BUS_ADDRESS
         fi
@@ -53,7 +85,7 @@ if [ -n "$private" ] && [ "${XDG_RUNTIME_DIR-}" = "$private" ]; then
     fi
 fi
 
-real=$(command -v -- "$name") || real=
+real=$(PATH=$clean_path; command -v -- "$name") || real=
 case $real in
     /*) ;;
     *) echo "$name: command not found" >&2; exit 127 ;;
@@ -61,5 +93,64 @@ esac
 if [ "$real" -ef "$0" ]; then
     echo "$name: only the KDE-RDP container shim was found on PATH" >&2
     exit 127
+fi
+
+if [ -n "$adopted" ] && [ "$name" = toolbox ]; then
+    # toolbox forwards a fixed list of its own variables (with XDG_RUNTIME_DIR
+    # now the account's) and needs podman to come back here, so it keeps the
+    # shim on PATH. An absolute WAYLAND_DISPLAY is rewritten like other paths.
+    case ${WAYLAND_DISPLAY-} in
+        '' | /*) ;;
+        *) WAYLAND_DISPLAY="$private/$WAYLAND_DISPLAY"; export WAYLAND_DISPLAY ;;
+    esac
+    exec "$real" "$@"
+fi
+PATH=$clean_path
+export PATH
+
+if [ -n "$adopted" ] && [ "$name" = podman ]; then
+    # Rewrite -e/--env values of exec, run and create (also as "container
+    # exec" and so on) from the subcommand up to the container or image name,
+    # so the in-container command is never touched. Before the subcommand a
+    # bare word after a --long option without "=" is taken as its value
+    # (--log-level debug exec). After it, the listed options take a separate
+    # value; any other option is assumed to have none. Getting that wrong only
+    # ends the scan early at the option's value, leaving later -e values
+    # unchanged; it never reaches the command. Other arguments are kept
+    # byte for byte.
+    state=global
+    previous=
+    count=$#
+    while [ "$count" -gt 0 ]; do
+        argument=$1
+        shift
+        count=$((count - 1))
+        if [ "$state" = global ]; then
+            case $argument in
+                exec | run | create) state=options ;;
+                container | -*) ;;
+                *) case $previous in --*=*) state=done ;; --*) ;; *) state=done ;; esac ;;
+            esac
+            previous=$argument
+        elif [ "$state" = env ]; then
+            rewrite_env "$argument"
+            argument=$rewritten
+            state=options
+        elif [ "$state" = value ]; then
+            state=options
+        elif [ "$state" = options ]; then
+            case $argument in
+                --) state=done ;;
+                --env=*) rewrite_env "${argument#--env=}"; argument="--env=$rewritten" ;;
+                -e | --env) state=env ;;
+                --cidfile | --detach-keys | --env-file | --preserve-fd | --preserve-fds | \
+                    -u | --user | -w | --workdir | --name | -v | --volume | --mount | \
+                    --network | -p | --publish | --label | --entrypoint | --pod) state=value ;;
+                -*) ;;
+                *) state=done ;;
+            esac
+        fi
+        set -- "$@" "$argument"
+    done
 fi
 exec "$real" "$@"

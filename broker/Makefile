@@ -4,7 +4,7 @@ CPPFLAGS += -D_FORTIFY_SOURCE=3
 WARNINGS = -std=c17 -Wall -Wextra -Werror -Wformat=2 -Wshadow -Wconversion
 LDLIBS = -lpam -lsystemd
 # Tools run through config/session-containers in remote desktops.
-CONTAINER_TOOLS = podman buildah distrobox distrobox-enter toolbox docker
+CONTAINER_TOOLS = podman buildah toolbox docker
 
 all: kde-rdp-broker
 kde-rdp-broker: broker.c

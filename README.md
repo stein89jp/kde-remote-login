@@ -91,14 +91,15 @@ backend renders with OpenGL on a GPU render node; a GPU is required (KWin's
 screencast does not work with software rendering).
 
 Rootless container tools work inside the remote desktop. The desktop keeps
-its private runtime directory and bus, so `podman`, `buildah`, `distrobox`,
-`toolbox` and rootless `docker` run through links that give only those tools the
-account's genuine `/run/user/UID` and systemd user bus: containers started from
-a local or SSH login can be entered (`distrobox enter`) from the remote desktop.
-Version 1.7.0 added this; start a fresh remote desktop after upgrading. GUI
-applications started inside a container open on the account's local display, not
-the remote desktop, and a shell startup file that rebuilds `PATH` from scratch
-bypasses the links.
+its private runtime directory and bus, so `podman`, `buildah`, `toolbox` and
+rootless `docker` run through links that give only those tools the account's
+genuine `/run/user/UID` and systemd user bus: containers started from a local or
+SSH login can be entered (`distrobox enter`, which reaches podman through the
+same link) from the remote desktop. GUI and audio applications started in a
+distrobox container, also from exported launchers, open on the remote desktop.
+Version 1.7.0 added this; start a fresh remote desktop after upgrading. Only a
+shell startup file that replaces `PATH` without keeping the inherited value
+bypasses the links; prepending or appending is fine.
 
 The release notes below were written for Niri-RDP, whose bridge, broker and
 audio this port reuses. Version 1.6.0 fixes Windows mstsc audio that played slowly and drifted behind the video: 44.1 kHz stereo PCM is now preferred. Version 1.5.6 fixed choppy remote motion. The headless compositor now presents

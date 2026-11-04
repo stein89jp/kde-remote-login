@@ -8,10 +8,10 @@ fi
 # logind retains its genuine /run/user/UID registration. The compositor and
 # applications use a private runtime so no local Wayland or desktop bus is reused.
 export XDG_RUNTIME_DIR="$KDE_RDP_RUNTIME_DIR"
-# Rootless container tools (podman, distrobox, toolbox, rootless docker) need
-# the account's genuine runtime and systemd user bus to reach containers
-# started from other logins. These links run only those tools with them; see
-# /usr/lib/kde-rdp/session-containers.
+# Rootless container tools (podman, toolbox, rootless docker; distrobox through
+# podman) need the account's genuine runtime and systemd user bus to reach
+# containers started from other logins. These links run only those tools with
+# them; see /usr/lib/kde-rdp/session-containers.
 export PATH="/usr/lib/kde-rdp/containers:${PATH:-/usr/bin:/bin}"
 # Initial size of KWin's virtual output: the RDP client's desktop size when
 # the broker knows it (KDE_RDP_WIDTH/KDE_RDP_HEIGHT), else 1920x1080. The

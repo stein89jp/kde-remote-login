@@ -988,8 +988,10 @@ fn run_worker(shared: Arc<Shared>, mut socket: UnixStream, generation: u64, wake
     let end = 'run: loop {
         let mut more = false;
         {
-            let now = shared.clock.now_ns();
+            // Read the clock under the lock: a frame queued while this
+            // thread waited for it must never look younger than it is.
             let mut state = shared.lock();
+            let now = shared.clock.now_ns();
             if state.generation != generation {
                 break End::Superseded;
             }

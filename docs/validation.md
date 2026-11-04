@@ -41,9 +41,9 @@ exec then failed in crun with `Permission denied` writing `cgroup.procs`,
 because the systemd user bus was still not used.
 
 Fix: `broker/config/session-containers`, installed as
-`/usr/lib/kde-rdp/session-containers` with `podman`, `buildah`, `distrobox`,
-`distrobox-enter`, `toolbox` and `docker` links in `/usr/lib/kde-rdp/containers`,
-which `session-worker` puts first on `PATH`. Only when `KDE_RDP_RUNTIME_DIR`
+`/usr/lib/kde-rdp/session-containers` with `podman`, `buildah`, `toolbox` and
+`docker` links in `/usr/lib/kde-rdp/containers`, which `session-worker` puts
+first on `PATH`. Only when `KDE_RDP_RUNTIME_DIR`
 equals `XDG_RUNTIME_DIR` and `/run/user/UID` exists and is owned by the account,
 the shim sets `XDG_RUNTIME_DIR=/run/user/UID`,
 `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/UID/bus` (when that socket
@@ -52,29 +52,66 @@ exists) and rewrites `DOCKER_HOST` only when it equals
 then removes its directory from `PATH` and execs the real tool. The desktop keeps
 its private runtime and bus.
 
+GUI and audio in containers: a first version also linked `distrobox` and
+`distrobox-enter`, but distrobox-enter forwards its whole environment
+(`printenv` as `--env=K=V`) into `podman exec`, so container applications got
+`/run/user/UID` and opened on the local display, and exported launchers calling
+`/usr/bin/distrobox-enter` bypassed the link and forwarded the private
+`XDG_RUNTIME_DIR`, which does not exist at that path inside the container.
+distrobox is no longer linked; it runs with the desktop's environment and its
+podman calls resolve to the podman link through `PATH`. Inside the container
+the host root is at `/run/host`, and `/run/host/run/kde-rdp/desktops/N` holds
+the private `wayland-0`, `pipewire-0` and `pulse/`; `/tmp` is shared, so
+`DISPLAY` and the private bus (`/tmp/dbus-*`) work unchanged. For podman `exec`,
+`run` and `create`, the shim therefore rewrites `-e`/`--env` values that equal
+or lie under the private runtime (also `unix:`, `unix:path=` and `unix://`
+addresses) to the same path below `/run/host`, scanning only from the
+subcommand to the container or image name so the in-container command is never
+changed. toolbox keeps its link, the desktop's bus and the shim on `PATH`, and
+gets an absolute `WAYLAND_DISPLAY` so its podman call rewrites it too.
+
 Automated: `tests/test_session_containers.py` runs the shim against stand-in
 tools (account runtime and user bus in a remote desktop, private bus kept
 without a user bus socket, no change outside a remote desktop or without an
 owned `/run/user/UID`, `DOCKER_HOST` rewrite only for the private socket,
-missing tool and self-reference failing without looping, and the
-`broker/Makefile` install rules for every link); `tests/test_host_setup.py` asserts the
+missing tool and self-reference failing without looping, the `--env` rewrite
+for `exec`, `run`, `create` and `container exec` with byte-exact preservation
+of other arguments (spaces, newlines, glob and quote characters), no rewrite of
+non-prefix values (`/x<private>`, `<private>-other`), of the in-container command,
+of other subcommands, outside a remote desktop or for other tools, toolbox's
+absolute `WAYLAND_DISPLAY` and kept bus, distrobox's podman calls through the
+link, and the `broker/Makefile` install rules for every link);
+`tests/test_host_setup.py` asserts the
 worker's `PATH` starts with `/usr/lib/kde-rdp/containers`.
 
 On this host, from inside a live KDE-RDP session: plain
 `podman exec --user stein php-dev id` failed with the passwd error; through the
 staged shim, `podman exec` and `distrobox enter php-dev -- id` succeeded
 (`uid=1000(stein)`), and the container saw `XDG_RUNTIME_DIR=/run/user/1000`.
+With the final shim (staged by `make -C broker install DESTDIR=...`, a copy with
+only a `podman` link first on `PATH`), both `/usr/bin/distrobox enter php-dev`
+and `/usr/bin/distrobox-enter php-dev` ran as `uid=1000(stein)` with
+`XDG_RUNTIME_DIR=/run/host/run/kde-rdp/desktops/31391`,
+`WAYLAND_DISPLAY=wayland-0`,
+`PULSE_SERVER=unix:/run/host/run/kde-rdp/desktops/31391/pulse/native`,
+`PIPEWIRE_RUNTIME_DIR=/run/host/run/kde-rdp/desktops/31391`, `DISPLAY=:0` and the
+private `DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-...`; the Wayland, Pulse,
+PipeWire, bus and X11 sockets all existed. A read-only Perl client inside the
+container connected to the Wayland socket and listed 67 globals of the remote
+KWin (`org_kde_plasma_shell` among them), and connected to the Pulse and
+PipeWire sockets; `dbus-send` on the bus listed `org.kde.KWin` and
+`org.kde.plasmashell`. `podman exec --user stein php-dev id` through the shim
+still succeeded.
 
 Not covered: Toolbox, buildah and rootless Docker are not installed here, so
-they are covered only by the stand-in tests. The installed package (rather than
-the staged shim) awaits the clean reinstall cycle and a fresh remote desktop.
-Known limitations: GUI applications started inside a container use
-`/run/user/UID`'s Wayland display, not the remote desktop; distrobox-exported
-`.desktop` launchers and other `distrobox-*` commands called by absolute path
-still forward the private `XDG_RUNTIME_DIR` into the container (podman itself is
-still fixed through `PATH`); a shell startup file that rebuilds `PATH` from
-scratch bypasses the links. Any shell works otherwise, since the fix is
-`PATH`-based.
+they are covered only by the stand-in tests; toolbox's GUI forwarding is
+untested, and its audio may still reach the local session because toolbox
+forwards only a fixed list of variables. No real GUI application or audible
+playback from a container was run. The installed package (rather than the
+staged shim) awaits the clean reinstall cycle and a fresh remote desktop. Known
+limitation: only a shell startup file that replaces `PATH` without keeping the
+inherited value bypasses the links; prepending or appending is fine. Any shell
+works otherwise, since the fix is `PATH`-based.
 
 ## KDE port: bridge capture on KWin 6.8.2, 2026-11-03
 

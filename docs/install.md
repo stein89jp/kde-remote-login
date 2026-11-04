@@ -267,15 +267,18 @@ starting unused backends.
 Upgrading fixes newly created remote sessions; reconnecting to
 a preserved session retains its old startup environment until that session logs out.
 
-Rootless container tools (`podman`, `buildah`, `distrobox`, `toolbox` and
-rootless `docker`) reach the same containers as your local and SSH logins: the
-session puts `/usr/lib/kde-rdp/containers` first on `PATH`, and its links run
-those tools alone with your genuine `/run/user/UID` and systemd user bus. GUI
-applications started inside a container appear on your local display, not the
-remote desktop. A shell startup file that rebuilds `PATH` from scratch bypasses
-the links, and distrobox-exported launchers and other tools called by absolute
-path still forward the private runtime into the container. A `~/.bashrc`
-workaround that reset `XDG_RUNTIME_DIR` for podman is no longer needed.
+Rootless container tools (`podman`, `buildah`, `toolbox`, rootless `docker`,
+and `distrobox` through podman) reach the same containers as your local and SSH
+logins: the session puts `/usr/lib/kde-rdp/containers` first on `PATH`, and its
+links run those tools alone with your genuine `/run/user/UID` and systemd user
+bus. In podman `exec`, `run` and `create`, environment values that point into
+the session's private runtime are rewritten to the same path below `/run/host`,
+so GUI and audio applications started in a distrobox container, also from
+exported launchers, open on the remote desktop. Toolbox gets the Wayland display
+the same way, but is untested. Only a shell startup file that replaces `PATH`
+without keeping the inherited value bypasses the links; prepending or appending
+is fine. A `~/.bashrc` workaround that reset `XDG_RUNTIME_DIR` for podman is no
+longer needed.
 
 ### Input methods and keyboard layouts
 
