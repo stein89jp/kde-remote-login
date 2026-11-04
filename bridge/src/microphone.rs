@@ -1862,7 +1862,9 @@ mod tests {
             let rig = Rig::new();
             let mut helper = rig.helper();
             for record in records {
-                helper.send(record);
+                // The frontend may already have closed on the first bad
+                // record, so a later write can fail with EPIPE.
+                let _ = helper.0.write_all(&record.encode());
             }
             assert!(helper.eof_within(Duration::from_secs(5)));
         }
