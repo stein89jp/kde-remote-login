@@ -76,6 +76,12 @@ launches Plasma; its single `start_plasma` function chooses `plasma_session`
 activation (otherwise kactivitymanagerd starts without the display and Plasma's
 shell refuses to load) and owns `org.kde.KWinWrapper` on the private bus for the
 session (otherwise `plasma_session` starts a nested `kwin_wayland_wrapper`).
+The worker also puts `/usr/lib/kde-rdp/containers` first on `PATH`. Its
+`podman`, `buildah`, `distrobox`, `distrobox-enter`, `toolbox` and `docker`
+links run `session-containers`, which hands only those tools the account's
+genuine `/run/user/UID` and systemd user bus (and a matching rootless
+`DOCKER_HOST`), so rootless containers are shared with the account's other
+logins instead of living in a second, empty user namespace.
 The worker prepends a session-only `XDG_CONFIG_DIRS` overlay with
 `[Plugins] shakecursorEnabled[$i]=false` in `kwinrc`: KWin's shake-cursor effect
 paints the cursor into screencast frames, and the immutable entry wins over the

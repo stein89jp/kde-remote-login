@@ -59,6 +59,19 @@ kde-rdp-broker (root; PAM, logind, per-UID lock)
 - W×H is the client's requested desktop size when the broker knows it, else
   1920×1080. The output name is whatever KWin reports (`Virtual-0` today);
   `KDE_RDP_OUTPUT` can select one by name.
+- Rootless container tools need the genuine runtime and systemd user bus:
+  podman keeps its user namespace (`libpod/tmp/pause.pid`) under
+  `XDG_RUNTIME_DIR` and creates scopes through the user manager, so with the
+  private values it would start a second, empty namespace. `session-worker`
+  puts `/usr/lib/kde-rdp/containers` first on `PATH`; its `podman`, `buildah`,
+  `distrobox`, `distrobox-enter`, `toolbox` and `docker` links run
+  `session-containers`, which, only when the private runtime is in effect and
+  `/run/user/UID` is owned by the account, sets `XDG_RUNTIME_DIR` and
+  `DBUS_SESSION_BUS_ADDRESS` to `/run/user/UID` and its `bus`, rewrites a
+  `DOCKER_HOST` pointing at the private `docker.sock`, drops itself from `PATH`
+  and execs the real tool. The desktop itself keeps its private runtime and
+  bus. Tools called by absolute path, such as distrobox-exported launchers,
+  still forward the private runtime into the container.
 - `session-worker` writes a session-only `XDG_CONFIG_DIRS` overlay that
   disables KWin's shake-cursor effect. That effect paints an enlarged cursor
   into screencast frames and hides the cursor metadata. The account's

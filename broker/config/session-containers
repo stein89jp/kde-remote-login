@@ -1,0 +1,65 @@
+#!/bin/sh
+# Rootless container tools inside a KDE-RDP desktop.
+#
+# The remote desktop runs on a private XDG_RUNTIME_DIR and a private D-Bus bus
+# (session-worker). Rootless podman keeps its user/mount namespace (the pause
+# process) under XDG_RUNTIME_DIR and creates its systemd scopes through the
+# account's systemd user bus. With the private values it starts a second,
+# empty namespace: containers started from a local or SSH login look "Up" but
+# cannot be entered ("unable to find user ...: no matching entries in passwd
+# file"), and exec into the user manager's cgroups is refused.
+#
+# session-worker puts /usr/lib/kde-rdp/containers first on PATH. Each name
+# there (podman, buildah, distrobox, distrobox-enter, toolbox, docker) is a
+# link to this script, which runs the real tool with the account's genuine
+# logind runtime (/run/user/UID) and systemd user bus, exactly what an SSH or
+# local login uses. Only the container tool sees these values: the desktop
+# keeps its private runtime and bus. Outside a KDE-RDP desktop, or when
+# /run/user/UID is missing or not owned by the account, nothing is changed.
+set -f
+shim_dir=/usr/lib/kde-rdp/containers
+user_runtime_root=/run/user
+name=${0##*/}
+
+# Drop this directory from PATH so the real tool, and everything it runs,
+# never re-enters the shim. Empty PATH entries (the current directory) go too.
+clean_path=
+old_ifs=$IFS
+IFS=:
+for entry in ${PATH-}; do
+    [ -n "$entry" ] && [ "$entry" != "$shim_dir" ] && clean_path=${clean_path:+$clean_path:}$entry
+done
+IFS=$old_ifs
+PATH=$clean_path
+export PATH
+
+private=${KDE_RDP_RUNTIME_DIR-}
+if [ -n "$private" ] && [ "${XDG_RUNTIME_DIR-}" = "$private" ]; then
+    host="$user_runtime_root/$(id -u)"
+    if [ -d "$host" ] && [ -O "$host" ]; then
+        XDG_RUNTIME_DIR=$host
+        export XDG_RUNTIME_DIR
+        if [ -S "$host/bus" ]; then
+            DBUS_SESSION_BUS_ADDRESS="unix:path=$host/bus"
+            export DBUS_SESSION_BUS_ADDRESS
+        fi
+        # Rootless Docker's documented DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock
+        # expands to the private runtime in a remote desktop. Point it back at
+        # the user's daemon. An unset DOCKER_HOST stays unset (the system daemon).
+        if [ "${DOCKER_HOST-}" = "unix://$private/docker.sock" ]; then
+            DOCKER_HOST="unix://$host/docker.sock"
+            export DOCKER_HOST
+        fi
+    fi
+fi
+
+real=$(command -v -- "$name") || real=
+case $real in
+    /*) ;;
+    *) echo "$name: command not found" >&2; exit 127 ;;
+esac
+if [ "$real" -ef "$0" ]; then
+    echo "$name: only the KDE-RDP container shim was found on PATH" >&2
+    exit 127
+fi
+exec "$real" "$@"

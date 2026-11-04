@@ -63,7 +63,24 @@ guide, then follow [install](install.md). Both frontends listen on TCP 33991 and
 
 ## Rebuild the installed combined package
 
-The release notes in this section and the history below predate the KDE port:
+Version `1.7.0-1`, published as `v1.7.0`, fixes rootless container tools inside
+a remote desktop on top of `1.6.0-1`. The desktop's private `XDG_RUNTIME_DIR`
+and D-Bus bus made rootless podman start a second, empty user namespace:
+containers started from a local or SSH login showed as `Up`, but
+`distrobox enter` failed with `unable to find user USER: no matching entries in
+passwd file`. `session-worker` now puts `/usr/lib/kde-rdp/containers` first on
+`PATH`; its `podman`, `buildah`, `distrobox`, `distrobox-enter`, `toolbox` and
+`docker` links run `/usr/lib/kde-rdp/session-containers`, which gives only
+those tools the account's genuine `/run/user/UID` and systemd user bus (and
+rewrites rootless Docker's `DOCKER_HOST` when it points into the private
+runtime). The desktop keeps its private runtime and bus. Use the clean
+[uninstall](uninstall.md) and [install](install.md) cycle (or stop both services
+and `pacman -U` the new package), then log out of any retained remote desktop and
+start a fresh one: an existing desktop keeps its old `PATH`. No configuration
+merge is needed. A `~/.bashrc` workaround that reset `XDG_RUNTIME_DIR` or
+`DBUS_SESSION_BUS_ADDRESS` for podman or distrobox can be removed.
+
+The remaining release notes in this section and the history below predate the KDE port:
 they describe Niri-RDP (the patched Niri compositor, `kde-rdp-headless`, KDL
 configuration and Waybar), kept for the bridge, broker and audio history they
 record. For KDE-RDP, use the clean [uninstall](uninstall.md) and
@@ -364,10 +381,11 @@ and `v1.0.1` exist without a GitHub release.
 | `1.5-1` | — | 2026-10-15 | `bae6626` | `26.04.remote1-9` | Published `v1.5`: 1.1.0-2 runtime as a release |
 | `1.5.5-1` | — | 2026-10-15 | `dfa3d13` | `26.04.remote2-1` | Published `v1.5.5`: Niri rebase, hardening, rich clipboard, microphone |
 | `1.5.6-1` | — | 2026-10-17 | `c1cdaba` | `26.04.remote2-1` + 0013 | Published `v1.5.6`: headless frame pacing, delay-based H.264 frame window |
-| `1.6.0-1` | — | 2026-10-20 | this release | `26.04.remote2-1` + 0013 | Published `v1.6.0`: 44.1 kHz stereo PCM for mstsc, earned audio drift skip, audio settings |
+| `1.6.0-1` | — | 2026-10-20 | `470247a` | `26.04.remote2-1` + 0013 | Published `v1.6.0`: 44.1 kHz stereo PCM for mstsc, earned audio drift skip, audio settings |
+| `1.7.0-1` | — | 2026-11-05 | this release | — | `v1.7.0`: rootless container tools (podman, distrobox) in remote desktops |
 
 `kde-rdp-headless` `26.04.remote1-7` does not appear in any commit. The
-PKGBUILDs and `scripts/prepare-release.py` carry `pkgver=1.6.0`/`pkgrel=1`. Bump the version again before
+PKGBUILDs and `scripts/prepare-release.py` carry `pkgver=1.7.0`/`pkgrel=1`. Bump the version again before
 building or publishing later changes, so packages with different contents never
 share a version.
 

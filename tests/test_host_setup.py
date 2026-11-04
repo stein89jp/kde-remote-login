@@ -538,6 +538,8 @@ class HostSetupTests(unittest.TestCase):
             self.assertNotIn(key, environment)
         self.assertEqual(environment["PIPEWIRE_REMOTE"], "pipewire-0")
         self.assertEqual(environment["PIPEWIRE_RUNTIME_DIR"], environment["KDE_RDP_RUNTIME_DIR"])
+        # Container tools resolve through the session-containers links first.
+        self.assertTrue(environment["PATH"].startswith("/usr/lib/kde-rdp/containers:"))
 
     def test_worker_uses_client_size_and_rejects_invalid_sizes(self):
         result = self.run_worker("auto", size=("1280", "720"))

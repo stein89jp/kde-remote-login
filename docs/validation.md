@@ -1,5 +1,8 @@
 # Validation record
 
+Release `1.7.0-1` (`v1.7.0`) packages the 2026-11-05 rootless container-tool
+fix below on top of `1.6.0-1`.
+
 Release `1.6.0-1` (`v1.6.0`) packages the Windows mstsc audio fix on top of
 `1.5.6-1`: 44.1 kHz stereo S16LE PCM preferred (48 kHz capture resampled to
 exactly 882 frames per 20 ms), stereo default with mono opt-in, the earned drift
@@ -20,6 +23,58 @@ Release `1.5.5-1` (`v1.5.5`) packages the work recorded in the 2026-10-15
 entries below. Their results are automated, namespace, lab and package checks;
 the user confirmed the installed-host Windows 10 mstsc checks for this release
 in [acceptance](acceptance.md) on 2026-10-17.
+
+## Rootless containers in a remote desktop, 2026-11-05
+
+Problem: inside a KDE-RDP desktop, containers started from a local or SSH login
+showed as `Up` in `distrobox list`, but `distrobox enter` failed with
+`Error: unable to find user stein: no matching entries in passwd file`.
+
+Root cause: the desktop's `XDG_RUNTIME_DIR` is the private
+`/run/kde-rdp/desktops/N` and its D-Bus bus is private, by design. Rootless
+podman keeps its user/mount namespace (the pause process,
+`$XDG_RUNTIME_DIR/libpod/tmp/pause.pid`) under `XDG_RUNTIME_DIR` and creates
+systemd scopes through the account's systemd user bus, so in the remote desktop
+it started a second, empty namespace in which the existing containers could not
+be entered. Overriding only `XDG_RUNTIME_DIR` reached the right namespace, but
+exec then failed in crun with `Permission denied` writing `cgroup.procs`,
+because the systemd user bus was still not used.
+
+Fix: `broker/config/session-containers`, installed as
+`/usr/lib/kde-rdp/session-containers` with `podman`, `buildah`, `distrobox`,
+`distrobox-enter`, `toolbox` and `docker` links in `/usr/lib/kde-rdp/containers`,
+which `session-worker` puts first on `PATH`. Only when `KDE_RDP_RUNTIME_DIR`
+equals `XDG_RUNTIME_DIR` and `/run/user/UID` exists and is owned by the account,
+the shim sets `XDG_RUNTIME_DIR=/run/user/UID`,
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/UID/bus` (when that socket
+exists) and rewrites `DOCKER_HOST` only when it equals
+`unix://<private runtime>/docker.sock` (an unset `DOCKER_HOST` stays unset). It
+then removes its directory from `PATH` and execs the real tool. The desktop keeps
+its private runtime and bus.
+
+Automated: `tests/test_session_containers.py` runs the shim against stand-in
+tools (account runtime and user bus in a remote desktop, private bus kept
+without a user bus socket, no change outside a remote desktop or without an
+owned `/run/user/UID`, `DOCKER_HOST` rewrite only for the private socket,
+missing tool and self-reference failing without looping, and the
+`broker/Makefile` install rules for every link); `tests/test_host_setup.py` asserts the
+worker's `PATH` starts with `/usr/lib/kde-rdp/containers`.
+
+On this host, from inside a live KDE-RDP session: plain
+`podman exec --user stein php-dev id` failed with the passwd error; through the
+staged shim, `podman exec` and `distrobox enter php-dev -- id` succeeded
+(`uid=1000(stein)`), and the container saw `XDG_RUNTIME_DIR=/run/user/1000`.
+
+Not covered: Toolbox, buildah and rootless Docker are not installed here, so
+they are covered only by the stand-in tests. The installed package (rather than
+the staged shim) awaits the clean reinstall cycle and a fresh remote desktop.
+Known limitations: GUI applications started inside a container use
+`/run/user/UID`'s Wayland display, not the remote desktop; distrobox-exported
+`.desktop` launchers and other `distrobox-*` commands called by absolute path
+still forward the private `XDG_RUNTIME_DIR` into the container (podman itself is
+still fixed through `PATH`); a shell startup file that rebuilds `PATH` from
+scratch bypasses the links. Any shell works otherwise, since the fix is
+`PATH`-based.
 
 ## KDE port: bridge capture on KWin 6.8.2, 2026-11-03
 

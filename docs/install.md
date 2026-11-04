@@ -267,6 +267,16 @@ starting unused backends.
 Upgrading fixes newly created remote sessions; reconnecting to
 a preserved session retains its old startup environment until that session logs out.
 
+Rootless container tools (`podman`, `buildah`, `distrobox`, `toolbox` and
+rootless `docker`) reach the same containers as your local and SSH logins: the
+session puts `/usr/lib/kde-rdp/containers` first on `PATH`, and its links run
+those tools alone with your genuine `/run/user/UID` and systemd user bus. GUI
+applications started inside a container appear on your local display, not the
+remote desktop. A shell startup file that rebuilds `PATH` from scratch bypasses
+the links, and distrobox-exported launchers and other tools called by absolute
+path still forward the private runtime into the container. A `~/.bashrc`
+workaround that reset `XDG_RUNTIME_DIR` for podman is no longer needed.
+
 ### Input methods and keyboard layouts
 
 The worker reads the host's saved XKB layout, model, variant, and options from
@@ -775,7 +785,7 @@ sudo systemctl restart kde-rdp-frontend.service
 
 ## Performance and desktop upgrades
 
-The combined 1.6.0 package includes damage-aware capture, input/resize coalescing,
+The combined 1.7.0 package includes damage-aware capture, input/resize coalescing,
 cached login rendering, stale-ACK recovery, separate negotiated cursor updates,
 a private bidirectional clipboard and deliberate DPI scaling. The clipboard
 carries Unicode text (up to 1 MiB), HTML (up to 4 MiB) and images (up to 32 MiB

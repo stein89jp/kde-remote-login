@@ -23,10 +23,10 @@ From the directory containing the downloaded package, run:
 
 ```sh
 sudo pacman -Syu
-sudo pacman -U ./kde-remote-login-1.6.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./kde-remote-login-1.7.0-1-x86_64.pkg.tar.zst
 ```
 
-The example uses version `1.6.0-1`; replace the filename if you downloaded a
+The example uses version `1.7.0-1`; replace the filename if you downloaded a
 different release. Pacman installs the package and its required runtime
 dependencies. Continue with the account authorization and service setup below.
 
@@ -89,6 +89,16 @@ optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
 budget, reusable capture buffers and unchanged-frame suppression. KWin's virtual
 backend renders with OpenGL on a GPU render node; a GPU is required (KWin's
 screencast does not work with software rendering).
+
+Rootless container tools work inside the remote desktop. The desktop keeps
+its private runtime directory and bus, so `podman`, `buildah`, `distrobox`,
+`toolbox` and rootless `docker` run through links that give only those tools the
+account's genuine `/run/user/UID` and systemd user bus: containers started from
+a local or SSH login can be entered (`distrobox enter`) from the remote desktop.
+Version 1.7.0 added this; start a fresh remote desktop after upgrading. GUI
+applications started inside a container open on the account's local display, not
+the remote desktop, and a shell startup file that rebuilds `PATH` from scratch
+bypasses the links.
 
 The release notes below were written for Niri-RDP, whose bridge, broker and
 audio this port reuses. Version 1.6.0 fixes Windows mstsc audio that played slowly and drifted behind the video: 44.1 kHz stereo PCM is now preferred. Version 1.5.6 fixed choppy remote motion. The headless compositor now presents
