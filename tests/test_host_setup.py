@@ -665,6 +665,10 @@ class HostSetupTests(unittest.TestCase):
         base = {"KDE_RDP_RUNTIME_DIR": "/private", "XDG_RUNTIME_DIR": "/private",
                 "WAYLAND_DISPLAY": "wayland-0", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus"}
         self.assertEqual(module.session_environment(base)["XDG_CURRENT_DESKTOP"], "KDE")
+        # Like startplasma: Plasma's menu is plasma-applications.menu.
+        self.assertEqual(module.session_environment(base)["XDG_MENU_PREFIX"], "plasma-")
+        self.assertEqual(module.session_environment(dict(base, XDG_MENU_PREFIX="custom-"))["XDG_MENU_PREFIX"],
+                         "custom-")
         for change in ({"XDG_RUNTIME_DIR": "/run/user/1000"}, {"WAYLAND_DISPLAY": ""},
                        {"DBUS_SESSION_BUS_ADDRESS": ""}):
             with self.subTest(change=change), self.assertRaises(RuntimeError):

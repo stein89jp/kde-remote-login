@@ -22,6 +22,7 @@ PLASMASHELL = "/usr/bin/plasmashell"
 # plasma_session's non-systemd startup launches its own kwin_wayland_wrapper
 # (a nested KWin inside ours) unless this name is already owned on the bus.
 KWIN_WRAPPER = "org.kde.KWinWrapper"
+MENU_PREFIX = "plasma-"
 SESSION = {
     "XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_DESKTOP": "KDE",
     "XDG_SESSION_TYPE": "wayland", "KDE_FULL_SESSION": "true", "KDE_SESSION_VERSION": "6",
@@ -34,7 +35,13 @@ def session_environment(environment):
         raise RuntimeError("session-plasma requires the private runtime")
     if not environment.get("WAYLAND_DISPLAY") or not environment.get("DBUS_SESSION_BUS_ADDRESS"):
         raise RuntimeError("session-plasma requires KWin's display and the private bus")
-    return dict(environment, KDE_SESSION_UID=str(os.getuid()), **SESSION)
+    session = dict(environment, KDE_SESSION_UID=str(os.getuid()), **SESSION)
+    # startplasma sets this; without it the application menu is built from
+    # applications.menu, which Plasma does not ship, and kbuildsycoca6 then
+    # caches a launcher with empty categories (search still works). The cache
+    # is shared with local logins, so a rebuild here broke theirs as well.
+    session.setdefault("XDG_MENU_PREFIX", MENU_PREFIX)
+    return session
 
 
 def activation_environment(environment):

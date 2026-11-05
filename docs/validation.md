@@ -24,6 +24,27 @@ entries below. Their results are automated, namespace, lab and package checks;
 the user confirmed the installed-host Windows 10 mstsc checks for this release
 in [acceptance](acceptance.md) on 2026-10-17.
 
+## Empty application menu after a rebuild in a remote desktop, 2026-11-05
+
+After `distrobox-export` added Krita launchers from a remote desktop, the Plasma
+launcher's category lists were empty on the next view (favorites and search
+still worked). `startplasma-wayland` sets `XDG_MENU_PREFIX=plasma-`, but
+`session-plasma` bypasses it and did not, so the `kbuildsycoca6` rebuild the new
+`.desktop` files triggered resolved `applications.menu`, which Plasma does not
+ship (Arch has only `/etc/xdg/menus/plasma-applications.menu`). The cache in
+`~/.cache` is shared with local logins, so it stayed empty there too until a
+rebuild with the prefix. Any application install or removal seen by a remote
+desktop's `kded6` had the same effect; it predates 1.7.0.
+
+`session-plasma` now sets `XDG_MENU_PREFIX=plasma-` unless the environment
+already has a value (regression in `tests/test_host_setup.py`). Evidence on this
+host: `kbuildsycoca6 --menutest` (prints the resolved menu, writes no cache)
+returned 0 entries without the prefix and 67 with `plasma-` (Development,
+Graphics, Internet, ...). `applications-kmenuedit.menu` edits are merged by
+`plasma-applications.menu` as well. Recovery for an already-emptied cache: in a
+remote desktop started after the upgrade (or a local login) run
+`kbuildsycoca6 --noincremental` once.
+
 ## Rootless containers in a remote desktop, 2026-11-05
 
 Problem: inside a KDE-RDP desktop, containers started from a local or SSH login
