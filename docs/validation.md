@@ -1,7 +1,7 @@
 # Validation record
 
-Release `1.7.0-1` (`v1.7.0`) packages the 2026-11-05 rootless container-tool
-fix below on top of `1.6.0-1`.
+Release `1.7.0-1` (`v1.7.0`) packages the 2026-11-05 rootless container-tool,
+application-menu and logout-teardown fixes below on top of `1.6.0-1`.
 
 Release `1.6.0-1` (`v1.6.0`) packages the Windows mstsc audio fix on top of
 `1.5.6-1`: 44.1 kHz stereo S16LE PCM preferred (48 kHz capture resampled to
@@ -23,6 +23,56 @@ Release `1.5.5-1` (`v1.5.5`) packages the work recorded in the 2026-10-15
 entries below. Their results are automated, namespace, lab and package checks;
 the user confirmed the installed-host Windows 10 mstsc checks for this release
 in [acceptance](acceptance.md) on 2026-10-17.
+
+## Next login refused after a Plasma logout, 2026-11-05
+
+After a Plasma logout in a remote desktop, the next login was refused
+(`result=local-session`) until the user ended the old logind session by hand.
+The journal at 09:22:17 showed the holder's `pam_unix(kde-rdp:session): session
+closed` and `logout ... result=desktop-exited session=5`, and logind's `Session
+5 logged out. Waiting for processes to exit.` The only process left in
+`session-5.scope` was podman's rootless pause process `catatonit`: it runs in
+its own process group, so the holder's group kill missed it. The broker parent
+then reaped the holder and called `TerminateSession`, but no logind activity
+followed (no scope stop, no `Removed session 5`, no "logind teardown failed"):
+the session stayed `closing` until a manual `loginctl` call at 09:23:54
+(`session-5.scope: Killing process 49700 (catatonit)`, `Removed session 5`).
+`graphical_sessions()` counts closing sessions on purpose (their applications
+may still run), so every login in between saw the account's own leftover
+Wayland session as a local one. The working explanation is that logind does not
+stop an already-closing session again on `TerminateSession`, and with the
+default `KillUserProcesses=no` it leaves the scope's remaining processes alone;
+the fix below does not depend on that.
+
+A second failure at 09:41: after another teardown,
+`/run/systemd/users/1000` still listed `SESSIONS=12 11 10 9` although session 9
+no longer existed (`loginctl` showed 12 11 10 and `/run/systemd/sessions/9` was
+gone). `sd_session_get_type("9")` returned `-ENXIO`, so `graphical_sessions()`
+failed closed and every login got `result=unavailable session=-`.
+
+Fixes in `broker/broker.c`: `graphical_sessions()` skips a listed session that
+logind no longer knows (`-ENXIO`/`-ENOENT`); a real Wayland/X11 session,
+including a closing one, still blocks the login and other lookup errors still
+fail closed. Teardown of a `kde-rdp` session (never another PAM service) now
+calls `KillSession(id, "all", signal)` after `TerminateSession` and keeps the
+session record while logind still lists the session, so the 5 s retry repeats
+it: the reap after a logout sends SIGTERM, and retries escalate to SIGKILL once
+that SIGTERM is 2 s old (the record's mtime marks it). A session logind reports
+gone (`NoSuchSession`, `ENXIO`, `ENOENT`, `ENODATA`) is done. On a service stop
+and in ExecStopPost the broker sends SIGTERM, polls for at most 2 s, then
+SIGKILLs what is left, within `TimeoutStopSec=30`.
+
+`broker/tests.c` fakes the logind calls and adds two groups: removed sessions
+are skipped while a Wayland session still yields 1 and an `-EIO` lookup -1;
+and teardown of a closing `kde-rdp` session with a SIGTERM-ignoring leftover
+issues `TerminateSession` then `KillSession` SIGTERM, retains the record, repeats
+SIGTERM within the grace and escalates to SIGKILL after it, drops records of
+vanished sessions and of an `sshd` session without any logind call, retains
+records on logind failures, and bounds the stop path (SIGTERM, about 2 s, SIGKILL;
+no wait without leftovers). `make -C broker check` passes 21 groups and
+`python3 -m unittest discover -s tests` passes. Real logind behavior still needs
+the user's clean reinstall and a Plasma logout with a running rootless podman
+container, followed by an immediate new login.
 
 ## Empty application menu after a rebuild in a remote desktop, 2026-11-05
 

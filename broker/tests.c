@@ -4,11 +4,15 @@
 #include <grp.h>
 #include <pwd.h>
 #include <security/pam_appl.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <systemd/sd-bus.h>
+#include <systemd/sd-login.h>
 #include <unistd.h>
 static int fake_setgroups(size_t count, const gid_t *groups) {
     assert(count == 0 && groups == NULL); return 0;
@@ -83,15 +87,105 @@ static int fake_open(pam_handle_t *pam, int flags) {
     return PAM_SUCCESS;
 }
 static int local_sessions; // >0 wayland sessions, <0 logind error.
+// When set, the user's logind session list instead (NULL-terminated).
+static const char *const *uid_session_list;
 static int fake_uid_sessions(uid_t uid, int require_active, char ***sessions) {
     assert(uid == 1000 && require_active == -1);
+    if (uid_session_list) {
+        int n = 0; while (uid_session_list[n]) n++;
+        *sessions = calloc((size_t)n + 1, sizeof(char *));
+        for (int i = 0; i < n; i++) (*sessions)[i] = strdup(uid_session_list[i]);
+        return n;
+    }
     if (local_sessions < 0) return -EIO;
     *sessions = calloc((size_t)local_sessions + 1, sizeof(char *));
     for (int i = 0; i < local_sessions; i++) (*sessions)[i] = strdup("c9");
     return local_sessions;
 }
+// c9 wayland, c5 tty; c8/c7 are listed but removed (ENXIO/ENOENT); c6 fails.
 static int fake_session_type(const char *session, char **type) {
+    if (!strcmp(session, "c8")) return -ENXIO;
+    if (!strcmp(session, "c7")) return -ENOENT;
+    if (!strcmp(session, "c6")) return -EIO;
+    if (!strcmp(session, "c5")) { *type = strdup("tty"); return 0; }
     assert(!strcmp(session, "c9")); *type = strdup("wayland"); return 0;
+}
+// A minimal logind for teardown. TerminateSession on a closing session does
+// nothing (as logind's session_stop() does); KillSession ends a session unless
+// its leftover process ignores the signal (SIGTERM only).
+struct fake_session {
+    const char *id, *service; pid_t leader;
+    bool exists, closing, ignores_term, lookup_fails;
+};
+static struct fake_session logind_sessions[4];
+static char logind_calls[1024];
+static bool logind_bus_fails;
+static struct fake_session *fake_find(const char *id) {
+    for (size_t i = 0; i < sizeof(logind_sessions) / sizeof(logind_sessions[0]); i++)
+        if (logind_sessions[i].id && !strcmp(logind_sessions[i].id, id)) return &logind_sessions[i];
+    return NULL;
+}
+static int fake_session_service(const char *session, char **service) {
+    struct fake_session *f = fake_find(session);
+    if (f && f->lookup_fails) return -EIO;
+    if (!f || !f->exists) return -ENXIO;
+    *service = strdup(f->service); return 0;
+}
+static int fake_session_leader(const char *session, pid_t *leader) {
+    struct fake_session *f = fake_find(session);
+    if (!f || !f->exists) return -ENXIO;
+    *leader = f->leader; return 0;
+}
+static int fake_get_sessions(char ***sessions) {
+    size_t total = sizeof(logind_sessions) / sizeof(logind_sessions[0]);
+    *sessions = calloc(total + 1, sizeof(char *)); int n = 0;
+    for (size_t i = 0; i < total; i++)
+        if (logind_sessions[i].id && logind_sessions[i].exists) (*sessions)[n++] = strdup(logind_sessions[i].id);
+    return n;
+}
+static char fake_bus_object;
+static int fake_bus_open(sd_bus **bus) {
+    if (logind_bus_fails) return -ECONNREFUSED;
+    *bus = (sd_bus *)(void *)&fake_bus_object; return 0;
+}
+static int fake_bus_timeout(sd_bus *bus, uint64_t usec) {
+    assert(bus == (sd_bus *)(void *)&fake_bus_object && usec > 0); return 0;
+}
+static sd_bus *fake_bus_unref(sd_bus *bus) {
+    assert(!bus || bus == (sd_bus *)(void *)&fake_bus_object); return NULL;
+}
+static void log_call(const char *line) {
+    size_t used = strlen(logind_calls);
+    assert(used + strlen(line) < sizeof(logind_calls));
+    strcpy(logind_calls + used, line);
+}
+static int fake_bus_call(sd_bus *bus, const char *destination, const char *path, const char *interface,
+                         const char *member, sd_bus_error *error, sd_bus_message **reply, const char *types, ...) {
+    assert(bus == (sd_bus *)(void *)&fake_bus_object && reply == NULL);
+    assert(!strcmp(destination, "org.freedesktop.login1") && !strcmp(path, "/org/freedesktop/login1") &&
+           !strcmp(interface, "org.freedesktop.login1.Manager"));
+    va_list args; va_start(args, types);
+    const char *id = va_arg(args, const char *), *who = NULL; int signo = 0;
+    char line[128];
+    if (!strcmp(member, "TerminateSession")) {
+        assert(!strcmp(types, "s"));
+        snprintf(line, sizeof(line), "terminate %s;", id);
+    } else {
+        assert(!strcmp(member, "KillSession") && !strcmp(types, "ssi"));
+        who = va_arg(args, const char *); signo = va_arg(args, int);
+        assert(!strcmp(who, "all"));
+        snprintf(line, sizeof(line), "kill %s %d;", id, signo);
+    }
+    va_end(args); log_call(line);
+    struct fake_session *f = fake_find(id);
+    // The broker never addresses another PAM service's session.
+    assert(!f || !strcmp(f->service, "kde-rdp"));
+    if (!f || !f->exists)
+        return sd_bus_error_set(error, "org.freedesktop.login1.NoSuchSession", "No session");
+    if (!signo) {
+        if (!f->closing) { f->closing = true; if (!f->ignores_term) f->exists = false; }
+    } else if (signo == SIGKILL || !f->ignores_term) f->exists = false;
+    return 1;
 }
 // Audit entries as "event result user rhost session"; a forked holder also
 // copies them to audit_fd so the parent can inspect them.
@@ -133,6 +227,13 @@ static int fake_end(pam_handle_t *pam, int status) {
 #define getpwnam fake_getpwnam
 #define sd_uid_get_sessions fake_uid_sessions
 #define sd_session_get_type fake_session_type
+#define sd_session_get_service fake_session_service
+#define sd_session_get_leader fake_session_leader
+#define sd_get_sessions fake_get_sessions
+#define sd_bus_open_system fake_bus_open
+#define sd_bus_set_method_call_timeout fake_bus_timeout
+#define sd_bus_unref fake_bus_unref
+#define sd_bus_call_method fake_bus_call
 #define AUDIT_SINK test_audit
 #define ROOT "broker-test-root"
 #define getgrnam fake_group
@@ -770,6 +871,110 @@ static void test_cleanup_grace(void) {
     }
     puts("PASS logout grants the whole process group a SIGTERM grace period before SIGKILL");
 }
+static void test_graphical_sessions(void) {
+    // A removed session still listed for the user (stale /run/systemd/users
+    // entry) is skipped; a real graphical session still counts.
+    const char *const stale[] = {"c8", "c7", "c5", NULL};
+    uid_session_list = stale; assert(graphical_sessions(1000) == 0);
+    const char *const mixed[] = {"c8", "c9", NULL};
+    uid_session_list = mixed; assert(graphical_sessions(1000) == 1);
+    // Any other lookup failure still fails closed.
+    const char *const failing[] = {"c8", "c6", NULL};
+    uid_session_list = failing; assert(graphical_sessions(1000) == -1);
+    uid_session_list = NULL;
+    puts("PASS sessions logind already removed are skipped; real graphical sessions and other errors still block login");
+}
+static pid_t dead_pid(void) {
+    pid_t child = fork(); assert(child >= 0);
+    if (!child) _exit(0);
+    assert(waitpid(child, NULL, 0) == child); return child;
+}
+static bool record_exists(pid_t pid) {
+    char path[128]; snprintf(path, sizeof(path), ROOT "/sessions/%ld", (long)pid);
+    return access(path, F_OK) == 0;
+}
+static void age_record(pid_t pid, time_t seconds) {
+    char path[128]; snprintf(path, sizeof(path), ROOT "/sessions/%ld", (long)pid);
+    struct timespec times[2] = {{.tv_sec = time(NULL) - seconds}, {.tv_sec = time(NULL) - seconds}};
+    assert(utimensat(AT_FDCWD, path, times, 0) == 0);
+}
+static void test_logind_teardown(void) {
+    assert(mkdir(ROOT, 0700) == 0 && mkdir(ROOT "/sessions", 0700) == 0);
+    pid_t closing_holder = dead_pid(), other_holder = dead_pid(), gone_holder = dead_pid();
+    memset(logind_sessions, 0, sizeof(logind_sessions));
+    // A Plasma logout left session 5 closing with one setsid process that
+    // ignores SIGTERM; session 6 belongs to another PAM service.
+    logind_sessions[0] = (struct fake_session){.id = "5", .service = "kde-rdp", .leader = closing_holder,
+        .exists = true, .closing = true, .ignores_term = true};
+    logind_sessions[1] = (struct fake_session){.id = "6", .service = "sshd", .leader = other_holder,
+        .exists = true};
+    assert(write_registry("5", closing_holder) == 0);
+    assert(write_registry("6", other_holder) == 0);
+    assert(write_registry("7", gone_holder) == 0);
+
+    // Holder reaped: TerminateSession alone would leave it; KillSession SIGTERMs.
+    logind_calls[0] = 0;
+    assert(terminate_record(closing_holder, SIGTERM));
+    assert(strstr(logind_calls, "terminate 5;kill 5 15;") && !strstr(logind_calls, "kill 5 9;"));
+    assert(record_exists(closing_holder) && logind_sessions[0].exists);
+    // Checking only issues no logind call.
+    logind_calls[0] = 0;
+    assert(terminate_id("5", 0) == 1 && !logind_calls[0]);
+    // A retry within the grace period repeats SIGTERM, a later one escalates.
+    logind_calls[0] = 0; retry_stale_records();
+    assert(strstr(logind_calls, "kill 5 15;") && !strstr(logind_calls, "kill 5 9;"));
+    assert(record_exists(closing_holder) && logind_sessions[0].exists);
+    // The other service's and the vanished session's records are dropped untouched.
+    assert(!strstr(logind_calls, " 6;") && !strstr(logind_calls, " 7;") && !strstr(logind_calls, " 7 "));
+    assert(!record_exists(other_holder) && !record_exists(gone_holder) && logind_sessions[1].exists);
+    age_record(closing_holder, 10);
+    logind_calls[0] = 0; retry_stale_records();
+    assert(strstr(logind_calls, "terminate 5;kill 5 9;"));
+    assert(!logind_sessions[0].exists && !record_exists(closing_holder));
+    // Once logind reports the session gone, nothing more is sent.
+    logind_calls[0] = 0; assert(!terminate_record(closing_holder, SIGKILL) && !logind_calls[0]);
+
+    // logind failures keep the record for a later retry.
+    pid_t failing_holder = dead_pid();
+    logind_sessions[2] = (struct fake_session){.id = "8", .service = "kde-rdp", .leader = failing_holder,
+        .exists = true, .lookup_fails = true};
+    assert(write_registry("8", failing_holder) == 0);
+    assert(terminate_record(failing_holder, SIGKILL) && record_exists(failing_holder));
+    logind_sessions[2].lookup_fails = false; logind_bus_fails = true;
+    assert(terminate_record(failing_holder, SIGKILL) && record_exists(failing_holder));
+    logind_bus_fails = false;
+    assert(!terminate_record(failing_holder, SIGTERM) && !record_exists(failing_holder));
+    assert(!logind_sessions[2].exists);
+
+    // Service stop: SIGTERM, a bounded wait, then SIGKILL for what is left.
+    pid_t stubborn_holder = dead_pid(), polite_holder = dead_pid();
+    logind_sessions[2] = (struct fake_session){.id = "9", .service = "kde-rdp", .leader = stubborn_holder,
+        .exists = true, .ignores_term = true};
+    logind_sessions[3] = (struct fake_session){.id = "10", .service = "kde-rdp", .leader = polite_holder,
+        .exists = true, .closing = true};
+    // Session 10 lost its record (holder died during PAM registration).
+    assert(write_registry("9", stubborn_holder) == 0);
+    logind_calls[0] = 0;
+    double started = monotonic_seconds(); cleanup_records();
+    double elapsed = monotonic_seconds() - started;
+    assert(strstr(logind_calls, "terminate 9;kill 9 15;") && strstr(logind_calls, "kill 9 9;"));
+    assert(strstr(logind_calls, "terminate 10;kill 10 15;") && !strstr(logind_calls, "kill 10 9;"));
+    assert(!logind_sessions[2].exists && !logind_sessions[3].exists && logind_sessions[1].exists);
+    assert(!record_exists(stubborn_holder) && !record_exists(polite_holder));
+    assert(elapsed >= 1.5 && elapsed < 5.0);
+    // Without leftovers the stop path does not wait.
+    pid_t quick_holder = dead_pid();
+    logind_sessions[2] = (struct fake_session){.id = "11", .service = "kde-rdp", .leader = quick_holder,
+        .exists = true};
+    assert(write_registry("11", quick_holder) == 0);
+    started = monotonic_seconds(); cleanup_records();
+    assert(monotonic_seconds() - started < 1.0 && !logind_sessions[2].exists && !record_exists(quick_holder));
+    assert(!strstr(logind_calls, " 6;") && !strstr(logind_calls, " 6 "));
+
+    memset(logind_sessions, 0, sizeof(logind_sessions));
+    assert(rmdir(ROOT "/sessions") == 0 && rmdir(ROOT) == 0);
+    puts("PASS teardown signals leftovers of closing kde-rdp sessions, retains records until gone, escalates to SIGKILL, never touches other services");
+}
 int main(void) {
     test_request_bounds(); test_desktop_size(); test_conversation(); test_rollback(); test_fd_transfer(); test_process_cleanup();
     test_auth_failures(); test_launch_failure(); test_group_authorization(); test_peer();
@@ -778,6 +983,7 @@ int main(void) {
     test_desktop_without_audio();
     test_microphone_descriptor();
     test_status_codes(); test_session_limits(); test_config(); test_cleanup_grace();
+    test_graphical_sessions(); test_logind_teardown();
     assert(valid_id("c42") && !valid_id("../gdm") && !valid_id(""));
-    printf("%d native broker groups passed; %d skipped (no PAM/logind session created)\n", 19-peer_skipped, peer_skipped); return 0;
+    printf("%d native broker groups passed; %d skipped (no PAM/logind session created)\n", 21-peer_skipped, peer_skipped); return 0;
 }

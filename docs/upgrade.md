@@ -90,6 +90,10 @@ it, an application menu rebuild inside a remote desktop (for example after
 installing or exporting an application) cached an empty category list, also
 seen by local logins. Run `kbuildsycoca6 --noincremental` once after upgrading
 if the launcher's categories are empty.
+After a Plasma logout the broker now also signals processes left in the closing
+logind session (such as podman's pause process) with `KillSession`, SIGTERM then
+SIGKILL, so the next login is no longer refused as `local-session`; a session
+logind already removed no longer makes every login `unavailable`.
 
 The remaining release notes in this section and the history below predate the KDE port:
 they describe Niri-RDP (the patched Niri compositor, `kde-rdp-headless`, KDL
@@ -393,7 +397,7 @@ and `v1.0.1` exist without a GitHub release.
 | `1.5.5-1` | — | 2026-10-15 | `dfa3d13` | `26.04.remote2-1` | Published `v1.5.5`: Niri rebase, hardening, rich clipboard, microphone |
 | `1.5.6-1` | — | 2026-10-17 | `c1cdaba` | `26.04.remote2-1` + 0013 | Published `v1.5.6`: headless frame pacing, delay-based H.264 frame window |
 | `1.6.0-1` | — | 2026-10-20 | `470247a` | `26.04.remote2-1` + 0013 | Published `v1.6.0`: 44.1 kHz stereo PCM for mstsc, earned audio drift skip, audio settings |
-| `1.7.0-1` | — | 2026-11-05 | this release | — | `v1.7.0`: rootless container tools (podman, distrobox) in remote desktops, container GUI and audio on the remote desktop, Plasma menu prefix |
+| `1.7.0-1` | — | 2026-11-05 | this release | — | `v1.7.0`: rootless container tools (podman, distrobox) in remote desktops, container GUI and audio on the remote desktop, Plasma menu prefix, next login after a Plasma logout (leftover session processes, stale logind session lists) |
 
 `kde-rdp-headless` `26.04.remote1-7` does not appear in any commit. The
 PKGBUILDs and `scripts/prepare-release.py` carry `pkgver=1.7.0`/`pkgrel=1`. Bump the version again before

@@ -58,6 +58,9 @@
 #define MAX_DESKTOP 4096
 // Processes in a logged-out session get this long to exit after SIGTERM.
 #define TERM_GRACE_TICKS 20
+// Processes left in a torn-down logind session get at least this long after
+// SIGTERM before retries use SIGKILL.
+#define LEFTOVER_GRACE_SECONDS 2
 
 // Codes other than REJECTED are sent only after PAM and the broker's own
 // group policy accepted the account, so they reveal nothing to a guesser.
@@ -348,7 +351,11 @@ static int graphical_sessions(uid_t uid) {
     if (n < 0) return -1;
     for (int i = 0; i < n; i++) {
         char *type = NULL;
-        if (sd_session_get_type(sessions[i], &type) < 0) found = -1;
+        int result = sd_session_get_type(sessions[i], &type);
+        // The user's session list can still name a session logind has already
+        // removed; that one cannot run anything. Other errors fail closed.
+        if (result == -ENXIO || result == -ENOENT) {}
+        else if (result < 0) found = -1;
         else if (!strcmp(type, "wayland") || !strcmp(type, "x11")) found = 1;
         free(type); free(sessions[i]);
     }
@@ -773,26 +780,60 @@ out:
     if (ready >= 0) close(ready);
     if (fd >= 0) close(fd);
 }
-static int terminate_id(const char *id) {
+static bool session_vanished(int result) {
+    return result == -ENXIO || result == -ENOENT || result == -ENODATA;
+}
+// TerminateSession when signo is 0, otherwise KillSession(id, "all", signo).
+// Returns 1 when logind no longer knows the session, 0 on success, -1 on error.
+static int logind_call(sd_bus *bus, const char *id, int signo) {
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    int result = signo ?
+        sd_bus_call_method(bus, "org.freedesktop.login1", "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager", "KillSession", &error, NULL, "ssi", id, "all", signo) :
+        sd_bus_call_method(bus, "org.freedesktop.login1", "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager", "TerminateSession", &error, NULL, "s", id);
+    if (sd_bus_error_has_name(&error, "org.freedesktop.login1.NoSuchSession")) result = 1;
+    else result = result < 0 ? -1 : 0;
+    sd_bus_error_free(&error); return result;
+}
+// Ends a kde-rdp logind session: TerminateSession, then signo (SIGTERM on the
+// first attempt, SIGKILL on later ones) to every process left in its scope.
+// With signo 0 only checks whether the session is gone. Returns 0 once logind
+// no longer knows the session (or it belongs to another service), 1 while it
+// still exists, and -1 on a logind failure.
+static int terminate_id(const char *id, int signo) {
     char *service = NULL;
     int result = sd_session_get_service(id, &service);
-    if (result < 0) return (result == -ENXIO || result == -ENOENT || result == -ENODATA) ? 0 : -1;
+    if (result < 0) return session_vanished(result) ? 0 : -1;
     // Never terminate a different PAM service even if stale IDs are recycled.
-    if (!strcmp(service, "kde-rdp")) {
-        sd_bus *bus = NULL; sd_bus_error error = SD_BUS_ERROR_NULL;
+    bool ours = !strcmp(service, "kde-rdp");
+    free(service); service = NULL;
+    if (!ours) return 0;
+    bool failed = false;
+    if (signo) {
+        sd_bus *bus = NULL;
         result = sd_bus_open_system(&bus);
         if (result >= 0) {
             sd_bus_set_method_call_timeout(bus, 5000000);
-            result = sd_bus_call_method(bus, "org.freedesktop.login1", "/org/freedesktop/login1",
-                "org.freedesktop.login1.Manager", "TerminateSession", &error, NULL, "s", id);
-            if (sd_bus_error_has_name(&error, "org.freedesktop.login1.NoSuchSession")) result = 0;
+            result = logind_call(bus, id, 0);
+            // A session already "closing" (a Plasma logout) is not stopped
+            // again by TerminateSession, and with KillUserProcesses=no logind
+            // leaves its remaining processes running (e.g. a setsid podman
+            // pause process). Signal whatever is left of the scope directly.
+            if (result != 1) {
+                failed = result < 0;
+                result = logind_call(bus, id, signo);
+            }
         }
-        sd_bus_error_free(&error); sd_bus_unref(bus);
+        sd_bus_unref(bus);
+        if (result == 1) return 0;
+        if (result < 0) failed = true;
     }
-    free(service);
-    return result < 0 ? -1 : 0;
+    result = sd_session_get_service(id, &service); free(service);
+    if (result < 0) return session_vanished(result) ? 0 : -1;
+    return failed ? -1 : 1;
 }
-static void terminate_unrecorded(pid_t pid) {
+static void terminate_unrecorded(pid_t pid, int signo) {
     char **sessions = NULL;
     int n = sd_get_sessions(&sessions);
     for (int i = 0; i < n; i++) {
@@ -804,53 +845,75 @@ static void terminate_unrecorded(pid_t pid) {
             // Recover the record if a holder died during PAM registration.
             // O_EXCL preserves an already recorded identity for this holder.
             if (valid_id(sessions[i])) write_registry(sessions[i], leader);
-            terminate_id(sessions[i]);
+            terminate_id(sessions[i], signo);
         }
         free(service);
         free(sessions[i]);
     }
     free(sessions);
 }
-static void terminate_record(pid_t pid) {
+// Returns true while the record is retained: its session still exists or
+// logind failed. The record's mtime marks the last graceful (SIGTERM) attempt.
+static bool terminate_record(pid_t pid, int signo) {
     char path[128], id[65] = {0};
     snprintf(path, sizeof(path), ROOT "/sessions/%ld", (long)pid);
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     bool keep = false;
     if (fd >= 0) {
-        ssize_t n = read(fd, id, sizeof(id)-1); close(fd);
-        if (n > 0 && valid_id(id)) keep = terminate_id(id) < 0;
+        ssize_t n = read(fd, id, sizeof(id)-1);
+        int result = n > 0 && valid_id(id) ? terminate_id(id, signo) : 0;
+        keep = result != 0;
+        if (keep && signo == SIGTERM) futimens(fd, NULL);
+        close(fd);
         if (!keep) unlink(path);
-        else fputs("logind teardown failed; session record retained for retry\n", stderr);
+        else if (result < 0)
+            fputs("logind teardown failed; session record retained for retry\n", stderr);
+        else if (signo == SIGKILL)
+            fprintf(stderr, "logind session %s still present after SIGKILL; record retained for retry\n", id);
     }
     // Covers SIGKILL or PAM failure between logind registration and registry write.
-    terminate_unrecorded(pid);
-    if (keep || access(path, F_OK) == 0) return;
+    terminate_unrecorded(pid, signo);
+    if (keep || access(path, F_OK) == 0) return true;
     char desktop[128];
     snprintf(desktop, sizeof(desktop), ROOT "/desktops/%ld", (long)pid);
     struct stat st;
     if (lstat(desktop, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid >= 1000)
         remove_desktop(desktop, st.st_uid, st.st_gid);
+    return false;
 }
+// Applies terminate_record to every record (only to dead holders when
+// stale_only); stale retries escalate to SIGKILL once the last graceful
+// attempt is LEFTOVER_GRACE_SECONDS old. Returns the records retained.
+static unsigned int record_pass(int signo, bool stale_only) {
+    DIR *dir = opendir(ROOT "/sessions"); if (!dir) return 0;
+    unsigned int retained = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        char *end; errno = 0; long pid = strtol(entry->d_name, &end, 10);
+        if (errno || *end || pid <= 0 || pid > INT_MAX) continue;
+        int send = signo;
+        if (stale_only) {
+            if (kill((pid_t)pid, 0) == 0 || errno != ESRCH) continue;
+            struct stat st;
+            if (fstatat(dirfd(dir), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+                time(NULL) - st.st_mtime < LEFTOVER_GRACE_SECONDS) send = SIGTERM;
+        }
+        if (terminate_record((pid_t)pid, send)) retained++;
+    }
+    closedir(dir); return retained;
+}
+// Service stop and ExecStopPost: bounded by the unit's stop timeout, so give
+// leftovers at most TERM_GRACE_TICKS after SIGTERM before SIGKILL.
 static void cleanup_records(void) {
-    DIR *dir = opendir(ROOT "/sessions"); if (!dir) { terminate_unrecorded(0); return; }
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        char *end; errno = 0; long pid = strtol(entry->d_name, &end, 10);
-        if (!errno && !*end && pid > 0 && pid <= INT_MAX) terminate_record((pid_t)pid);
+    // Reconstruct records of holders that died before writing theirs.
+    terminate_unrecorded(0, SIGTERM);
+    unsigned int retained = record_pass(SIGTERM, false);
+    for (unsigned int i = 0; retained && i < TERM_GRACE_TICKS; i++) {
+        usleep(100000); retained = record_pass(0, false);
     }
-    closedir(dir);
-    terminate_unrecorded(0);
+    if (retained) record_pass(SIGKILL, false);
 }
-static void retry_stale_records(void) {
-    DIR *dir = opendir(ROOT "/sessions"); if (!dir) return;
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        char *end; errno = 0; long pid = strtol(entry->d_name, &end, 10);
-        if (!errno && !*end && pid > 0 && pid <= INT_MAX &&
-            kill((pid_t)pid, 0) < 0 && errno == ESRCH) terminate_record((pid_t)pid);
-    }
-    closedir(dir);
-}
+static void retry_stale_records(void) { record_pass(SIGKILL, true); }
 static bool peer_allowed(int fd, uid_t uid) {
     struct ucred peer; socklen_t size = sizeof(peer);
     return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) == 0 &&
@@ -892,7 +955,7 @@ int main(int argc, char **argv) {
     while (!stopping) {
         if (time(NULL) - retried >= 5) { retry_stale_records(); retried = time(NULL); }
         for (int i = 0; i < MAX_JOBS; i++) if (jobs[i] && waitpid(jobs[i], NULL, WNOHANG) == jobs[i]) {
-            terminate_record(jobs[i]); jobs[i] = 0; if (ready[i] >= 0) close(ready[i]); ready[i] = -1;
+            terminate_record(jobs[i], SIGTERM); jobs[i] = 0; if (ready[i] >= 0) close(ready[i]); ready[i] = -1;
         }
         for (int i = 0; i < MAX_JOBS; i++) if (jobs[i] && ready[i] >= 0) {
             char byte;
@@ -931,7 +994,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < MAX_JOBS; i++) if (jobs[i]) kill(jobs[i], SIGTERM);
     for (int i = 0; i < MAX_JOBS; i++) if (jobs[i]) {
         while (waitpid(jobs[i], NULL, 0) < 0 && errno == EINTR) {}
-        terminate_record(jobs[i]);
+        terminate_record(jobs[i], SIGTERM);
     }
     cleanup_records(); return 0;
 }

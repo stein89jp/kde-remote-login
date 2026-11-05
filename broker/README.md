@@ -219,9 +219,21 @@ sessions whose PAM service is `kde-rdp`. A holder crash is also matched by
 logind's recorded leader PID, covering death between PAM registration and record
 creation. ExecStopPost scans records and service-owned logind sessions after a
 broker crash. It never terminates GNOME/GDM/GRD or unrelated sessions.
-Transient logind failures retain records for 5s retries; an unrecorded crashed
-holder's record is reconstructed from logind before termination. Directories
-remain until the session's asynchronous termination is observed on a later retry.
+After `TerminateSession` the broker also calls `KillSession(id, "all", signal)`:
+processes that left the compositor's process group (for example podman's
+rootless pause process) survive a Plasma logout, logind then keeps the session
+`closing` with the default `KillUserProcesses=no`, and `TerminateSession` does
+not end a session that is already closing. While logind still lists the
+session, its record is retained and retried every 5s: the reap after a logout
+sends SIGTERM, and retries send SIGKILL once that SIGTERM is 2s old (the
+record's mtime). A service stop and ExecStopPost send SIGTERM, wait at most 2s
+for the sessions to disappear, then send SIGKILL, inside `TimeoutStopSec`. A
+session logind reports gone counts as done. Transient logind failures also
+retain records for 5s retries; an unrecorded crashed holder's record is
+reconstructed from logind before termination. Directories remain until the
+session's termination is observed on a later retry. When counting the account's
+graphical sessions, a session that the user's logind list still names but logind
+no longer knows (`ENXIO`/`ENOENT`) is skipped; closing sessions still count.
 Real logind TerminateSession and descendant cgroup cleanup need target-machine
 validation; native process-group tests are not proof of cgroup cleanup. Programs
 that deliberately start persistent user-manager units need a separate lifetime
