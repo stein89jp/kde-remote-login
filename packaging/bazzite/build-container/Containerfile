@@ -1,0 +1,38 @@
+# Build environment for the KDE-RDP RPM (packaging/bazzite/install.sh).
+#
+# The host's Fedora release plus the repository its FFmpeg comes from, so the
+# RPM's automatic soname dependencies (libavcodec.so.N, ...) match the host.
+# Bazzite uses negativo17's fedora-multimedia; the installer copies the host's
+# own .repo file into repos/ (enabled) for that case.
+ARG FEDORA_VERSION
+FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
+ARG FFMPEG_SOURCE=negativo17
+COPY repos/ /etc/yum.repos.d/
+RUN set -eu; \
+    case "$FFMPEG_SOURCE" in \
+        negativo17) ffmpeg="libavcodec-devel libavutil-devel libswscale-devel libswresample-devel" ;; \
+        rpmfusion) dnf -y install "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm"; \
+                   ffmpeg="ffmpeg-devel" ;; \
+        fedora) ffmpeg="libavcodec-free-devel libavutil-free-devel libswscale-free-devel libswresample-free-devel" ;; \
+        *) echo "unknown FFMPEG_SOURCE: $FFMPEG_SOURCE" >&2; exit 1 ;; \
+    esac; \
+    dnf -y install --setopt=install_weak_deps=False \
+        rpm-build systemd-rpm-macros cargo rust gcc make pkgconf-pkg-config python3 \
+        pam-devel systemd-devel libxkbcommon-devel wayland-devel \
+        mesa-libEGL-devel mesa-libGL-devel libglvnd-devel pipewire-devel $ffmpeg \
+        openssl python3-gobject dbus-daemon dbus-tools pipewire pipewire-utils \
+        pulseaudio-utils procps-ng util-linux findutils diffutils which tar gzip; \
+    dnf clean all
+# The FFmpeg command line from the same repository, for the third-party
+# license notice (scripts/collect-licenses.py records its version and license).
+RUN set -eu; \
+    case "$FFMPEG_SOURCE" in fedora) cli=ffmpeg-free ;; *) cli=ffmpeg ;; esac; \
+    dnf -y install --setopt=install_weak_deps=False "$cli"; \
+    dnf clean all
+# lld: Cargo links the bridge with it, as Rust does on Arch (see the spec).
+# WirePlumber and pipewire-pulse: %check's private PipeWire integration tests
+# run session-audio and session-microphone against Fedora's own configs.
+RUN dnf -y install --setopt=install_weak_deps=False lld wireplumber pipewire-pulseaudio && \
+    dnf clean all
+COPY build-rpm.sh /usr/local/bin/build-rpm.sh
+ENTRYPOINT ["/usr/local/bin/build-rpm.sh"]

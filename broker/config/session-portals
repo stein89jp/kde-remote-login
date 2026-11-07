@@ -5,6 +5,19 @@ from pathlib import Path
 import subprocess
 import time
 
+# Arch installs the portal frontend and backends in /usr/lib; Fedora (and
+# Bazzite) in /usr/libexec.
+PORTAL_DIRS = ("/usr/lib", "/usr/libexec")
+
+
+def portal_executable(name):
+    """Return the installed portal executable NAME, or None."""
+    for directory in PORTAL_DIRS:
+        path = Path(directory, name)
+        if path.is_file():
+            return str(path)
+    return None
+
 
 def bus_owner(name, environment, timeout=2):
     result = subprocess.run([
@@ -24,9 +37,9 @@ def replace_stale_backends(environment):
     # backends or affect host routing.
     for backend in ("gnome", "gtk"):
         name = "org.freedesktop.impl.portal.desktop." + backend
-        executable = "/usr/lib/xdg-desktop-portal-" + backend
         owner = bus_owner(name, environment)
-        if owner is None or not Path(executable).is_file():
+        executable = portal_executable("xdg-desktop-portal-" + backend)
+        if owner is None or executable is None:
             continue
         process = subprocess.Popen([executable, "--replace"], env=environment)
         deadline = time.monotonic() + 5
@@ -67,7 +80,8 @@ def main():
     replace_stale_backends(environment)
     # Replace a frontend activated before the display was exported. Later
     # activation keeps the same host-first backend selection.
-    os.execve("/usr/lib/xdg-desktop-portal", ["xdg-desktop-portal", "--replace"], environment)
+    frontend = portal_executable("xdg-desktop-portal") or PORTAL_DIRS[0] + "/xdg-desktop-portal"
+    os.execve(frontend, ["xdg-desktop-portal", "--replace"], environment)
 
 
 if __name__ == "__main__":

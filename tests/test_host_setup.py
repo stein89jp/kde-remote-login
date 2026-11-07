@@ -351,8 +351,11 @@ class HostSetupTests(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True), \
                 patch.object(portals.subprocess, "run") as update, \
                 patch.object(portals, "replace_stale_backends") as replace, \
+                patch.object(portals, "portal_executable", return_value="/usr/lib/xdg-desktop-portal"), \
                 patch.object(portals.os, "execve") as execute:
             portals.main()
+            self.assertEqual(execute.call_args.args[:2],
+                             ("/usr/lib/xdg-desktop-portal", ["xdg-desktop-portal", "--replace"]))
             update.assert_called_once()
             arguments = update.call_args.args[0]
             self.assertNotIn("--systemd", arguments)
@@ -394,6 +397,43 @@ class HostSetupTests(unittest.TestCase):
                 patch.object(portals.subprocess, "Popen") as start:
             portals.replace_stale_backends(environment)
             start.assert_not_called()
+
+    def test_portal_executables_prefer_arch_location_and_fall_back_to_libexec(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lib, libexec = Path(directory, "lib"), Path(directory, "libexec")
+            lib.mkdir()
+            libexec.mkdir()
+            with patch.object(portals, "PORTAL_DIRS", (str(lib), str(libexec))):
+                self.assertIsNone(portals.portal_executable("xdg-desktop-portal"))
+                # Fedora/Bazzite: only /usr/libexec has the frontend and backends.
+                (libexec / "xdg-desktop-portal").touch()
+                (libexec / "xdg-desktop-portal-gtk").touch()
+                self.assertEqual(portals.portal_executable("xdg-desktop-portal"),
+                                 str(libexec / "xdg-desktop-portal"))
+                # Arch: /usr/lib wins when both exist.
+                (lib / "xdg-desktop-portal").touch()
+                self.assertEqual(portals.portal_executable("xdg-desktop-portal"),
+                                 str(lib / "xdg-desktop-portal"))
+                environment = {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus"}
+                with patch.object(portals, "bus_owner", side_effect=[None, 's ":1.1"', 's ":1.2"']), \
+                        patch.object(portals.subprocess, "Popen") as start, \
+                        patch.object(portals.time, "sleep"):
+                    start.return_value.poll.return_value = None
+                    portals.replace_stale_backends(environment)
+                    start.assert_called_once_with([str(libexec / "xdg-desktop-portal-gtk"), "--replace"],
+                                                  env=environment)
+        self.assertEqual(portals.PORTAL_DIRS, ("/usr/lib", "/usr/libexec"))
+
+    def test_portal_startup_without_installed_frontend_keeps_arch_path(self):
+        with patch.dict(os.environ, {"KDE_RDP_RUNTIME_DIR": "/private/remote",
+                                    "XDG_RUNTIME_DIR": "/private/remote", "WAYLAND_DISPLAY": "wayland-1",
+                                    "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus"}, clear=True), \
+                patch.object(portals.subprocess, "run"), \
+                patch.object(portals, "replace_stale_backends"), \
+                patch.object(portals, "portal_executable", return_value=None), \
+                patch.object(portals.os, "execve") as execute:
+            portals.main()
+            self.assertEqual(execute.call_args.args[0], "/usr/lib/xdg-desktop-portal")
 
     def test_portal_backend_replacement_is_bounded(self):
         with patch.object(portals, "bus_owner", return_value='s ":1.1"'), \
@@ -683,7 +723,10 @@ class HostSetupTests(unittest.TestCase):
 
     def test_packaging_targets_plasma_without_compositor_or_desktop_grant(self):
         makefile = (ROOT / "broker/Makefile").read_text()
-        self.assertIn("/usr/lib/kde-rdp/session-plasma", makefile)
+        # The Arch layout stays the default; tests/test_install_layout.py
+        # checks the installed tree for both layouts.
+        self.assertIn("LIBEXECDIR ?= /usr/lib/kde-rdp\n", makefile)
+        self.assertIn("session-plasma", makefile.split("SESSION_HELPERS = ", 1)[1].split("\n\n", 1)[0])
         # KWin 6.8.2 has no .desktop interface grant (docs/kde-findings.md).
         self.assertNotIn("/usr/share/applications", makefile)
         for removed in ("session-desktop", "headless.kdl", "waybar.json",
@@ -818,11 +861,41 @@ class HostSetupTests(unittest.TestCase):
     def test_existing_account_gets_supplementary_membership_without_password_reset(self):
         account = type("Account", (), {"pw_uid": 1000, "pw_shell": "/bin/bash"})()
         with patch.object(setup.pwd, "getpwnam", return_value=account), \
+                patch.object(setup, "ensure_local_group") as local_group, \
                 patch.object(setup.subprocess, "run") as run:
             setup.authorize("alice")
             self.assertEqual(run.call_count, 2)
             self.assertEqual(run.call_args.args[0],
                              ["/usr/bin/usermod", "-aG", "kde-rdp-users", "--", "alice"])
+            local_group.assert_called_once_with()
+
+    def test_image_only_group_is_copied_to_etc_group_before_usermod(self):
+        with tempfile.TemporaryDirectory() as directory:
+            etc_group, image_group = Path(directory, "group"), Path(directory, "image-group")
+            etc_group.write_text("root:x:0:\nwheel:x:10:stein")
+            etc_group.chmod(0o644)
+            image_group.write_text("audio:x:63:\nkde-rdp-users:x:958:\nkde-rdp:x:957:\n")
+            libc = type("Libc", (), {"lckpwdf": lambda self: 0, "ulckpwdf": lambda self: 0})()
+            with patch.object(setup, "ETC_GROUP", etc_group), \
+                    patch.object(setup, "IMAGE_GROUP", image_group), \
+                    patch.object(setup.ctypes, "CDLL", return_value=libc):
+                # Fedora Atomic: rpm-ostree created the group in the image only.
+                self.assertTrue(setup.ensure_local_group())
+                self.assertEqual(etc_group.read_text(),
+                                 "root:x:0:\nwheel:x:10:stein\nkde-rdp-users:x:958:\n")
+                self.assertEqual(etc_group.stat().st_mode & 0o777, 0o644)
+                # Idempotent, and never duplicates or rewrites an /etc entry.
+                self.assertFalse(setup.ensure_local_group())
+                self.assertEqual(etc_group.read_text().count("kde-rdp-users"), 1)
+                # Arch: no image group file, nothing to do.
+                image_group.unlink()
+                etc_group.write_text("root:x:0:\n")
+                self.assertFalse(setup.ensure_local_group())
+                self.assertEqual(etc_group.read_text(), "root:x:0:\n")
+                # Members recorded in the image entry are not copied.
+                image_group.write_text("kde-rdp-users:x:958:mallory\n")
+                self.assertTrue(setup.ensure_local_group())
+                self.assertEqual(etc_group.read_text(), "root:x:0:\nkde-rdp-users:x:958:\n")
 
 
 if __name__ == "__main__":

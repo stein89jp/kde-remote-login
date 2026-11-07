@@ -41,11 +41,16 @@ if root["name"] == "kde-rdp-bridge":
 
     libraries = ("libavcodec", "libavutil", "libswscale", "libswresample")
     versions = capture(["pkg-config", "--modversion", *libraries]).splitlines()
+    arch = shutil.which("pacman") is not None
+    # The Bazzite/Fedora RPM links the distribution's FFmpeg (negativo17 on
+    # Bazzite); its RPM metadata below records where that came from.
+    provenance = ("Arch package provenance: https://archlinux.org/packages/extra/x86_64/ffmpeg/\n" if arch
+                  else "RPM package provenance: see the FFmpeg package metadata below.\n")
     sections.append("\n=== FFmpeg system libraries linked by kde-rdp-bridge ===\n"
                     "These dynamically linked libraries are supplied by the platform FFmpeg package; "
                     "they are not included in this project's source archive.\n"
                     "Upstream source and licensing: https://ffmpeg.org/legal.html\n"
-                    "Arch package provenance: https://archlinux.org/packages/extra/x86_64/ffmpeg/\n"
+                    f"{provenance}"
                     "Original bridge source retains its MIT license.\n")
     for library, version in zip(libraries, versions, strict=True):
         sections.append(f"Linked build library: {library} {version}\n")
@@ -53,9 +58,15 @@ if root["name"] == "kde-rdp-bridge":
                     f"{capture(['ffmpeg', '-version'])}\n"
                     f"\n--- Platform FFmpeg license notice ---\n"
                     f"{capture(['ffmpeg', '-hide_banner', '-L'])}\n")
-    if shutil.which("pacman"):
+    if arch:
         sections.append(f"\n--- Arch FFmpeg package metadata ---\n"
                         f"{capture(['pacman', '-Qi', 'ffmpeg'])}\n")
+    elif shutil.which("rpm"):
+        libdir = Path(capture(["pkg-config", "--variable=libdir", "libavcodec"]))
+        packages = sorted({capture(["rpm", "-qf", str((libdir / f"{library}.so").resolve())])
+                           for library in libraries})
+        sections.append(f"\n--- RPM FFmpeg package metadata ---\n"
+                        f"{capture(['rpm', '-qi', *packages])}\n")
     sections.append("\n=== Optional GPU capture/conversion system libraries ===\n"
                     "EGL/OpenGL dispatch is supplied by libglvnd; GBM by Mesa.\n"
                     "The CUDA driver is dynamically loaded from the installed NVIDIA driver.\n"

@@ -96,7 +96,8 @@ class SessionIsolationTests(unittest.TestCase):
         while True:
             try:
                 status = Path(f"/proc/{child_pid}/stat").read_text().split(") ", 1)[1].split()[0]
-            except FileNotFoundError:
+            # Reaped before or between opening and reading stat.
+            except (FileNotFoundError, ProcessLookupError):
                 status = None
             if status in (None, "Z") or time.monotonic() >= deadline:
                 break

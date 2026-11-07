@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>KDE Remote Login</short>
+  <description>KDE-RDP remote desktop (Windows Remote Desktop / RDP over TLS). The port matches KDE_RDP_LISTEN in /etc/kde-rdp/frontend.conf.</description>
+  <port protocol="tcp" port="33991"/>
+</service>

@@ -1,0 +1,12 @@
+; SELinux policy module "kde_rdp" for the Fedora/Bazzite package.
+;
+; The broker is a system service (unconfined_service_t). Its PAM stack runs
+; pam_selinux, which selects the account's login context (unconfined_t for an
+; ordinary unconfined_u user, exactly as for SSH or a local login), but Fedora's
+; policy only lets sshd and display managers enter user domains: exec of
+; dbus-run-session into the desktop is otherwise denied. Both domains are
+; unconfined, so this grants no new access; it only lets remote desktops run
+; in the user's context instead of the service's. noatsecure, rlimitinh and
+; siginh keep the environment, limits and signal state the broker prepared,
+; as for sshd.
+(allow unconfined_service_t unconfined_t (process (transition noatsecure rlimitinh siginh)))

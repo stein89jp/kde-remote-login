@@ -239,9 +239,11 @@ class ContainerShimTests(unittest.TestCase):
     def test_broker_install_links_every_tool_and_worker_prefers_them(self):
         makefile = (ROOT / "broker/Makefile").read_text()
         self.assertIn("CONTAINER_TOOLS = " + " ".join(TOOLS) + "\n", makefile)
-        self.assertIn('install -Dm755 config/session-containers "$(DESTDIR)/usr/lib/kde-rdp/session-containers"',
-                      makefile)
-        self.assertIn('ln -sfn ../session-containers "$(DESTDIR)/usr/lib/kde-rdp/containers/$$tool"', makefile)
+        self.assertIn("LIBEXECDIR ?= /usr/lib/kde-rdp\n", makefile)
+        self.assertIn("session-containers", makefile.split("SESSION_HELPERS = ", 1)[1].split("\n\n", 1)[0])
+        self.assertIn('ln -sfn ../session-containers "$(DESTDIR)$(LIBEXECDIR)/containers/$$tool"', makefile)
+        # tests/test_install_layout.py checks the installed links and the
+        # rewritten shim directory for both the Arch and Fedora layouts.
         worker = (ROOT / "broker/config/session-worker").read_text()
         self.assertIn('export PATH="/usr/lib/kde-rdp/containers:${PATH:-/usr/bin:/bin}"\n', worker)
         self.assertLess(worker.index('export XDG_RUNTIME_DIR="$KDE_RDP_RUNTIME_DIR"'),

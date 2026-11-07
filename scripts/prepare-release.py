@@ -30,6 +30,10 @@ def selected_files():
                 if (product in {"src", "pkg"} or product.startswith("repo-")
                         or ".tar." in product or product.endswith(".log")):
                     continue
+            # packaging/bazzite/install.sh builds there: container context,
+            # source tarball and RPMs, never release sources.
+            if relative.parts[:3] == ("packaging", "bazzite", "out"):
+                continue
             if item.is_symlink():
                 raise RuntimeError(f"release input must not be a symlink: {relative}")
             if item.is_file() and item.suffix not in {".pyc", ".o"}:

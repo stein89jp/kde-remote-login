@@ -1,10 +1,55 @@
 #!/usr/bin/python3
 """Authorize a remote-login account and prepare the host's TLS certificate."""
 import argparse
+import ctypes
 import os
+from pathlib import Path
 import pwd
 import re
 import subprocess
+
+GROUP = "kde-rdp-users"
+ETC_GROUP = Path("/etc/group")
+# Fedora Atomic (Bazzite): groups created while rpm-ostree layers a package
+# land in the image's /usr/lib/group (nss-altfiles), which usermod never edits.
+IMAGE_GROUP = Path("/usr/lib/group")
+
+
+def group_entry(path, name):
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return None
+    return next((line for line in lines if line.split(":", 1)[0] == name), None)
+
+
+def ensure_local_group(name=GROUP):
+    """Copy an image-only group into /etc/group so usermod can record members.
+
+    NSS merges both files, so the copy (without members) changes nothing until
+    usermod adds the account. A no-op on Arch, which has no /usr/lib/group."""
+    if group_entry(ETC_GROUP, name) is not None:
+        return False
+    line = group_entry(IMAGE_GROUP, name)
+    if line is None:
+        return False
+    fields = line.split(":")
+    if len(fields) != 4:
+        raise ValueError(f"unexpected {IMAGE_GROUP} entry for {name}")
+    fields[3] = ""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.lckpwdf() != 0:
+        raise OSError(ctypes.get_errno(), "cannot lock the account files")
+    try:
+        # Append in place: the file keeps its mode, owner and SELinux label.
+        with ETC_GROUP.open("r+") as stream:
+            content = stream.read()
+            if content and not content.endswith("\n"):
+                stream.write("\n")
+            stream.write(":".join(fields) + "\n")
+    finally:
+        libc.ulckpwdf()
+    return True
 
 
 def account_name(value):
@@ -30,6 +75,7 @@ def authorize(name, create=False):
             "nologin" in account.pw_shell or account.pw_shell in ("/bin/false", "/usr/bin/false"):
         raise ValueError("choose a normal login account with UID >= 1000")
     subprocess.run(["/usr/bin/systemd-sysusers", "/usr/lib/sysusers.d/kde-rdp.conf"], check=True)
+    ensure_local_group()
     subprocess.run(["/usr/bin/usermod", "-aG", "kde-rdp-users", "--", name], check=True)
 
 

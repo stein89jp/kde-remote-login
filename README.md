@@ -1,10 +1,13 @@
-# KDE Remote Login for Arch Linux
+# KDE Remote Login for Arch Linux and Bazzite
 
 A remote desktop host that runs a private **KDE Plasma 6** session on stock
 KWin's virtual backend, with an IronRDP frontend and a PAM/logind session
 broker. Install the complete host on an up-to-date **Arch Linux x86_64** machine
 with Plasma 6 installed. KDE-RDP is a port of Niri-RDP, which used a patched
 headless Niri; it ships no compositor of its own.
+
+**On Bazzite** (KDE images, or another Fedora Atomic KDE desktop) the same host
+installs with one command; see [Bazzite](#bazzite-fedora-atomic) below.
 
 **Prerequisites:** Plasma 6 (`plasma-desktop`, pulled in as a dependency), a GPU
 render node usable by the remote account (software rendering is unsupported), and
@@ -14,6 +17,25 @@ Niri-RDP stopped or uninstalled: both frontends listen on TCP 33991, and
 This is an **open-source project**. Original integration code is MIT-licensed;
 upstream components retain their respective licenses. See the
 [licensing and source-availability guide](docs/licensing.md).
+
+## Bazzite (Fedora Atomic)
+
+On a Bazzite KDE image with KWin 6.8 or newer, run from a normal terminal (not
+inside toolbox or distrobox):
+
+```sh
+git clone https://github.com/stein89jp/kde-remote-login.git
+cd kde-remote-login
+./packaging/bazzite/install.sh
+```
+
+The installer builds the RPM in a podman container matching your system,
+layers it with `rpm-ostree` without a reboot, authorizes your account, opens
+the firewall if needed, enables NVIDIA encoding when an NVIDIA GPU is present,
+and starts the service. Then log out locally and connect with Windows Remote
+Desktop to `HOST:33991`. Run it again from an updated checkout to update. See
+[install on Bazzite](docs/install-bazzite.md) and
+[uninstall](docs/uninstall-bazzite.md). The sections below are for Arch.
 
 ## Install a binary release
 

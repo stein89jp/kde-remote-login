@@ -24,6 +24,70 @@ entries below. Their results are automated, namespace, lab and package checks;
 the user confirmed the installed-host Windows 10 mstsc checks for this release
 in [acceptance](acceptance.md) on 2026-10-17.
 
+## Bazzite (Fedora Atomic) package, 2026-11-07
+
+Adds a Bazzite / Fedora Atomic KDE build next to the Arch package:
+`packaging/bazzite/` (RPM spec, podman build container, one-command
+`install.sh` and `uninstall.sh`, `probe.sh`), the Fedora PAM stack
+`packaging/fedora/kde-rdp.pam` (with `pam_selinux`) and the SELinux module
+`packaging/fedora/kde_rdp.cil`; see [install-bazzite](install-bazzite.md).
+Shared changes keep Arch output identical: `broker/Makefile` takes
+`LIBEXECDIR`/`UNITDIR`/`PAM_FILE` (Arch defaults; the Fedora layout rewrites
+the `/usr/lib/kde-rdp` prefix to `/usr/libexec/kde-rdp` at install time),
+`session-portals` also finds the portals in `/usr/libexec`, `kde-rdp-setup`
+copies an image-only `kde-rdp-users` entry into `/etc/group` before `usermod`,
+`scripts/collect-licenses.py` records RPM FFmpeg metadata on non-Arch builds
+and `scripts/prepare-release.py` skips `packaging/bazzite/out/`.
+
+**Host:** Bazzite `bazzite-nvidia-open:stable` 45.20261105 (Fedora 45,
+KWin/Plasma 6.8.2, FFmpeg 9.0.2 from negativo17, PipeWire 1.6.11, SELinux
+enforcing, firewalld zone `FedoraWorkstation`) in a QEMU/KVM VM with a virtio
+(virgl) render node and no NVIDIA GPU. The VM was first probed on Fedora 44 /
+KWin 6.7.5; the installer refuses KWin older than 6.8, whose libkwin still
+carries the `.desktop` interface grant. **Client:** FreeRDP 3 (`xfreerdp3` on
+Xvfb) from an Arch distrobox on the same VM, over the VM's LAN address.
+
+| Check | Result |
+| --- | --- |
+| Arch regression | `make check` passes (lint, Python, broker, Rust); the default `make -C broker install` output is byte-identical to the sources (`tests/test_install_layout.py`); regenerated third-party notices differ only in host `pacman -Qi` metadata |
+| RPM build (`fedora:45` + negativo17 container) | `%check` passes: Rust unit and integration tests, broker tests, 146 Python tests including the private PipeWire audio and microphone integration on Fedora's PipeWire/WirePlumber (skips: opt-in NVENC, lab FreeRDP AAC, Arch PAM lab). Requires `libavcodec.so.63` etc., matching the host |
+| Install | `install.sh` layers with `rpm-ostree` and applies live (no reboot), activates the SELinux module, authorizes the account and starts the services: about 1.5 minutes with a warm cache, 3.5 with the test suites. Broker and frontend `unconfined_service_t`, helpers `bin_t` in `/usr/libexec/kde-rdp`, listener `0.0.0.0:33991`; the firewall was left alone (zone allows 1025-65535) |
+| RDP login | Full Plasma desktop (Bazzite panel, Portal, announcements); first login of a fresh account shows the splash for about 25 s. logind session `Service=kde-rdp Type=wayland Remote=yes`. Desktop `unconfined_t`, Xwayland `xserver_t`, private bus `unconfined_dbusd_t`; no AVC denials |
+| Input, resume, logout | Mouse click and typed text (upper case, digits) reach applications; a reconnect within the grace window resumed the same desktop with its typed text; after the grace window the desktop logged out |
+| Audio | Client offered PCM 44.1/48 kHz, AAC, ADPCM; the server chose 44.1 kHz stereo PCM, drift skip on; the default sink is `kde-rdp-sink` |
+| Capture | `DMA-BUF screencast unavailable; using SHM` on virtio-gpu, then normal frames |
+| Containers, Flatpak | In a remote Konsole: `podman` resolves to `/usr/libexec/kde-rdp/containers/podman` and uses `/run/user/UID` rootless; `distrobox list` works; `flatpak run` sandboxes start and the Firefox Flatpak opened on the remote desktop |
+| Update | Re-running `install.sh` replaced the layered package live (`apply-live --allow-replacement`), restarted the services and kept the TLS fingerprint |
+| Autologin | A System Settings autologin (`/etc/plasmalogin.conf.d/kde_settings.conf`, `User=kdetest`) was detected and turned off with `zz-kde-rdp-no-autologin.conf` |
+| Uninstall | `uninstall.sh` stopped and disabled the services, removed the SELinux module and staged the package removal; `/etc` keeps only `/etc/kde-rdp` and the `kde-rdp-users` line by design (`--purge` removes them). A reinstall before the reboot worked |
+| Reboot, real client | After a reboot into the deployment with the package layered, the services started at boot and the `kde_rdp` module was in the booted policy. Without a local login, the user connected as their own account from Android's Windows App on the local network and confirmed it worked "just like the Arch version": login success, 44.1 kHz stereo PCM chosen (the client offered PCM 44.1/48 kHz only), session ended `result=ok`; no KDE-RDP AVC denials that boot |
+
+Fixed during this validation:
+
+- rpm-ostree creates the sysusers group in `/usr/lib/group`; `usermod -aG`
+  then recorded nothing (the account was not authorized). `kde-rdp-setup`
+  copies the entry to `/etc/group` first; `install.sh` verifies membership.
+- SELinux denied `unconfined_service_t` → `unconfined_t` `process transition`
+  on `/usr/bin/dbus-run-session`, which `pam_selinux` requests, so the broker
+  answered "unavailable". The one-rule module `kde_rdp` allows it; both
+  domains are unconfined.
+- Fedora's rustc links with `ld.bfd`, Arch's with `rust-lld`. `bridge/build.rs`
+  emits the FFmpeg, PipeWire and GL libraries before the static C archives
+  that use them, which only lld resolves for the library's test binary. The
+  spec links with lld (`-C link-arg=-fuse-ld=lld`); `build.rs` is unchanged.
+- Root in a rootless container cannot raise `RLIMIT_CORE`, which a broker test
+  expects of root; the build container runs as the invoking user (podman
+  `--userns=keep-id`), as makepkg refuses root.
+
+Known differences: the private bus cannot launch the accessibility bus under
+Fedora's policy (`SELINUX_ERR ... gnome_atspi_t`; no screen readers, Flatpak
+prints `Can't find a11y bus`), and polkit asks remote sessions for an
+administrator password for actions such as network control.
+
+**Open:** Windows mstsc on Bazzite (Android's Windows App is confirmed);
+NVENC on `bazzite-nvidia` with a real NVIDIA GPU; a Bazzite update with the
+package layered, including an FFmpeg soname bump; and long-run audio.
+
 ## Next login refused after a Plasma logout, 2026-11-05
 
 After a Plasma logout in a remote desktop, the next login was refused

@@ -96,3 +96,7 @@ lab/kwin/out/
 
 # Local assistant instructions are kept out of the public repository.
 CLAUDE.md
+
+# Bazzite/Fedora RPM build products (packaging/bazzite/install.sh).
+/packaging/bazzite/out/
+*.rpm

@@ -9,6 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 PAM_FILE = ROOT / "broker/config/kde-rdp.pam"
+FEDORA_PAM_FILE = ROOT / "packaging/fedora/kde-rdp.pam"
 FAILLOCK_ARGS = ["dir=/run/faillock-kde-rdp", "deny=5", "unlock_time=300"]
 GATE_ARGS = ["uid", ">=", "1000", "user", "ingroup", "kde-rdp-users", "quiet"]
 
@@ -131,6 +132,83 @@ class PamPolicyTests(unittest.TestCase):
     def test_parser_handles_optional_and_bracketed_controls(self):
         rules = parse_pam("-auth [success=2 default=ignore] pam_x.so a b # c\n# x\n")
         self.assertEqual(rules, [("auth", True, "[success=2 default=ignore]", "pam_x.so", ["a", "b"])])
+
+
+class FedoraPamPolicyTests(unittest.TestCase):
+    """packaging/fedora/kde-rdp.pam: the Bazzite/Fedora stack keeps the same two
+    deliberate changes as the Arch policy. Arch has no pam_selinux, so the
+    stack itself only runs on Fedora (docs/validation.md)."""
+
+    def setUp(self):
+        self.rules = parse_pam(FEDORA_PAM_FILE.read_text())
+
+    def test_policy_is_self_contained(self):
+        # authselect regenerates password-auth/system-auth; never depend on them.
+        for rule in self.rules:
+            self.assertNotIn(rule[2], ("include", "substack"), rule)
+            self.assertTrue(rule[3].endswith(".so"), rule)
+            for name in ("password-auth", "system-auth", "postlogin", "sshd"):
+                self.assertNotIn(name, " ".join(rule[3:4] + tuple(rule[4])), rule)
+        self.assertEqual({rule[0] for rule in self.rules}, {"auth", "account", "session"})
+
+    def test_both_policies_share_the_group_gate_and_private_faillock(self):
+        arch = parse_pam(PAM_FILE.read_text())
+        for rules in (arch, self.rules):
+            self.assertEqual(rules[0], ("auth", False, "required", "pam_succeed_if.so", GATE_ARGS))
+            faillock = [rule for rule in rules if rule[3] == "pam_faillock.so"]
+            self.assertEqual([rule[4][0] for rule in faillock], ["preauth", "authfail", "authsucc"])
+            for rule in faillock:
+                self.assertEqual(rule[0], "auth")
+                self.assertEqual(rule[4][1:], FAILLOCK_ARGS, rule)
+            for rule in rules:
+                if rule[3] == "pam_succeed_if.so":
+                    self.assertNotIn(rule[2], ("requisite", "sufficient"), rule)
+                if rule[3] == "pam_unix.so":
+                    self.assertNotIn("nodelay", rule[4], rule)
+
+    def test_auth_mirrors_fedora_password_auth_with_private_faillock(self):
+        auth = stack(self.rules, "auth")
+        self.assertEqual(
+            [(rule[1], rule[2], rule[3]) for rule in auth],
+            [
+                (False, "required", "pam_succeed_if.so"),
+                (False, "required", "pam_shells.so"),
+                (False, "requisite", "pam_nologin.so"),
+                (False, "required", "pam_env.so"),
+                (False, "required", "pam_faildelay.so"),
+                (False, "required", "pam_faillock.so"),
+                (False, "[success=1 default=bad]", "pam_unix.so"),
+                (False, "[default=die]", "pam_faillock.so"),
+                (False, "required", "pam_faillock.so"),
+            ],
+        )
+        # success=1 must skip exactly authfail and land on authsucc.
+        unix = next(i for i, rule in enumerate(auth) if rule[3] == "pam_unix.so")
+        self.assertEqual(auth[unix + 1][4][0], "authfail")
+        self.assertEqual(auth[unix + 2][4][0], "authsucc")
+        self.assertIn("delay=2000000", next(rule for rule in auth if rule[3] == "pam_faildelay.so")[4])
+
+    def test_session_enters_the_users_selinux_context_like_sshd(self):
+        session = stack(self.rules, "session")
+        self.assertEqual(
+            [(rule[1], rule[2], rule[3], rule[4]) for rule in session],
+            [
+                (False, "required", "pam_selinux.so", ["close"]),
+                (False, "required", "pam_loginuid.so", []),
+                (False, "required", "pam_selinux.so", ["open"]),
+                (False, "required", "pam_namespace.so", []),
+                (False, "optional", "pam_keyinit.so", ["force", "revoke"]),
+                (False, "required", "pam_limits.so", []),
+                (False, "required", "pam_unix.so", []),
+                (False, "optional", "pam_umask.so", ["silent"]),
+                (False, "required", "pam_systemd.so", ["type=wayland", "class=user", "desktop=KDE"]),
+            ],
+        )
+        self.assertEqual(
+            [(rule[1], rule[2], rule[3]) for rule in stack(self.rules, "account")],
+            [(False, "required", "pam_sepermit.so"), (False, "required", "pam_nologin.so"),
+             (False, "required", "pam_unix.so")],
+        )
 
 
 HARNESS = r"""

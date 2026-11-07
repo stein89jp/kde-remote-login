@@ -36,6 +36,23 @@ Optional NVIDIA acceleration uses driver libraries supplied separately by the
 host. The installer bundles neither NVIDIA drivers nor FFmpeg libraries.
 External drivers and the Windows RDP client remain subject to their own terms.
 
+## Bazzite and Fedora Atomic builds
+
+The Bazzite installer (`packaging/bazzite/install.sh`) builds the RPM on the
+user's own machine, against the host's FFmpeg, and layers it there. The project
+publishes no Bazzite or Fedora binaries: the repository carries only the build
+recipe, installer scripts and configuration, under the same licenses as the rest
+of the source.
+
+Bazzite's FFmpeg comes from the negativo17 repository, which builds it with
+`--enable-nonfree`; its license notice states that the build is not legally
+redistributable. An RPM built against it is therefore for local use only and
+must not be shared or uploaded, for example as a release asset. The spec's
+`License:` tag (`MIT AND GPL-3.0-only`) describes the source and a build against
+a GPL FFmpeg, not a nonfree one. Publishing prebuilt RPMs or a COPR repository
+would first need a licensing review, for example building against Fedora's
+`ffmpeg-free` or RPM Fusion's FFmpeg and correcting the `License:` tag to match.
+
 ## Source for the published installer
 
 Release `v1.7.0` carries the `1.7.0-1` installer
