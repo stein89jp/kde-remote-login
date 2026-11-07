@@ -85,6 +85,7 @@ Desktop.ini
 PLAN.md
 PLAN2.md
 PLAN3.md
+bazzite-plan.md
 
 # Niri source archives are downloaded and hash-checked by makepkg (pins.json);
 # research/upstream checkouts are superseded by bridge/vendor and the pins.
