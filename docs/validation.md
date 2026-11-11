@@ -1,5 +1,13 @@
 # Validation record
 
+Release `1.8.0-1` (`v1.8.0`) packages the two 2026-11-11 entries below (video
+rate control, quantiser floor, still-screen refinement and keyframes; frontend
+memory and DDC probing) on top of `1.7.0-1`. Their results are automated,
+encoder, delivery-model and package checks plus a first installed session; the
+user installed the build on the Arch host on 2026-11-11, reconnected and
+reported it "working great". The itemised real-client checks in
+[acceptance](acceptance.md) remain pending.
+
 Release `1.7.0-1` (`v1.7.0`) packages the 2026-11-05 rootless container-tool,
 application-menu and logout-teardown fixes below on top of `1.6.0-1`.
 
@@ -26,9 +34,21 @@ in [acceptance](acceptance.md) on 2026-10-17.
 
 ## Video rate latch, quantiser floor, still-screen refinement and keyframes, 2026-11-11
 
-Unreleased; real-client validation is pending (see the last bullets). Evidence
-is under `artifacts/video-2026-11-11/`: the harness sources, their outputs and
-a compressed `tcp_info` trace (counters only).
+Released in `1.8.0-1`. The itemised real-client checks are pending (see the
+last bullets); the first installed session is recorded here. Evidence is under
+`artifacts/video-2026-11-11/`: the harness sources, their outputs and a
+compressed `tcp_info` trace (counters only).
+
+- First installed session, 2026-11-11: the user installed the package built
+  from this tree with `pacman -U`, restarted the frontend (15:39 JST),
+  reconnected at 1920x1080 (NVENC AVC420, GPU capture, 44.1 kHz stereo PCM)
+  and reported it "working great". In the first seven minutes the journal
+  (`KDE_RDP_DIAGNOSTICS=1`) shows 20,474 delivered frames with 4 IDRs, 207
+  refinement frames, 3 tolerated delay episodes, 2 level decreases and 2
+  increases, 37 credit-wait frames, 10,010 frames with a held rate increase,
+  no held decrease and 2 audio-delay lines. This is a short ordinary session,
+  not the itemised checks below: no A/B against `KDE_RDP_MIN_QP=1`, no
+  hour-long run, no throttled link and no listening test were reported.
 
 - Finding: with `KDE_RDP_DIAGNOSTICS=1` on the installed 1.7.0 host, a day of
   Windows mstsc use over the internet (TCP RTT 22–35 ms, 1080p, NVENC AVC420,
@@ -184,8 +204,9 @@ a compressed `tcp_info` trace (counters only).
 
 ## Frontend memory limit, heap hygiene and DDC probing, 2026-11-11
 
-Unreleased; the installed-host checks are pending (last bullet). Nothing here
-was tested with a real RDP client or on Bazzite.
+Released in `1.8.0-1`. A first installed session is recorded in the second
+last bullet; the remaining installed-host checks are pending (last bullet).
+Nothing here was tested on Bazzite.
 
 - Finding: systemd's records for the installed frontend (NVENC, 1080p, limit
   `MemoryMax=512M`) show a peak of exactly 512M on 2026-11-06 and 2026-11-10
@@ -239,13 +260,21 @@ was tested with a real RDP client or on Bazzite.
   assertions; broker 21 groups. The fixed-threshold test runs its checks in a
   fresh process, because other tests of the same binary leave large free heap
   chunks behind.
-- Pending on the installed host after a reinstall: the `start` memory line
-  shows `max_bytes` 1610612736; a 1080p GPU-capture session reports
-  `capture_shm_pool_releases` 1 and a lower `anon_bytes` than before;
-  `anon_bytes` returns to about its start value after disconnects instead of
-  ratcheting upward; `events_max` and `events_oom_kill` stay 0 over a long
-  day; a 4K session and a large clipboard image stay well below the limit;
-  the journal shows no `i2c_open_bus_basic` lines at login.
+- First installed session, 2026-11-11 (the package built from this tree,
+  frontend restarted 15:39 JST, a fresh desktop at 15:40): the `start` memory
+  line reports `max_bytes` 1610612736 and a trim of 7.7 MB in 0.5 ms;
+  `capture_shm_pool_releases` is 1; seven minutes into a 1080p NVENC session
+  the cgroup holds 172 MB (149 MB anonymous, 16 MB file, 5.5 MB kernel; peak
+  184 MB) with `events_max` and `events_oom_kill` 0. These figures are not
+  comparable with the 405 MiB measured before the restart: library pages that
+  were already cached then stay charged where they were, and a like-for-like
+  figure needs a boot. powerdevil runs with `POWERDEVIL_NO_DDCUTIL=1` and the
+  journal has no `i2c_open_bus_basic` line at that login. The user reported
+  the session "working great".
+- Still pending on the installed host: the figures after a boot and over a
+  long day; `anon_bytes` after several disconnects; `events_max` and
+  `events_oom_kill` staying 0 over that day; a 4K session and a large
+  clipboard image staying well below the limit.
 
 ## Bazzite (Fedora Atomic) package, 2026-11-07
 

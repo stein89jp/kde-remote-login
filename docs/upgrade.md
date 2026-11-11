@@ -63,7 +63,32 @@ guide, then follow [install](install.md). Both frontends listen on TCP 33991 and
 
 ## Rebuild the installed combined package
 
-Version `1.7.0-1`, published as `v1.7.0`, fixes rootless container tools inside
+Version `1.8.0-1`, published as `v1.8.0`, changes video rate control, still
+picture quality and the frontend's memory handling on top of `1.7.0-1`.
+One delayed flight of frames (a brief link stall) is no longer treated as
+congestion, which used to cut the frame window and bitrate and could hold a
+healthy connection at a low rate for minutes. The NVENC encoder has a
+quantiser floor (`KDE_RDP_MIN_QP`, 1-51, default 18; 1 disables it), a still
+screen is refined until the encoder has nothing left to add instead of once
+after 750 ms, the periodic keyframe default rises from 30 to 3600 seconds
+(`KDE_RDP_GOP_SECONDS`), and the live encoder is reconfigured only when a new
+rate level changes what it sends; a reduction caused by audio congestion still
+applies with the next changed frame. The frontend releases its SHM capture
+buffers once GPU capture is in effect, returns freed heap to the system after
+disconnects, logs `"component":"memory"` lines under `KDE_RDP_DIAGNOSTICS=1`,
+and its unit's `MemoryMax` rises from 512M to 1536M. Remote sessions run with
+`POWERDEVIL_NO_DDCUTIL=1`, so Plasma no longer probes the host's monitors over
+DDC/CI at each login. See [performance.md](performance.md) for the details.
+Stop both services and `pacman -U` the new package (or use the clean
+[uninstall](uninstall.md) and [install](install.md) cycle), run
+`systemctl daemon-reload` and start the services; log out of a retained remote
+desktop and start a fresh one for the DDC change. No configuration merge is
+needed: an existing `/etc/kde-rdp/frontend.conf` is kept, and the new defaults
+apply unless it sets `KDE_RDP_GOP_SECONDS` explicitly, in which case that
+value stays. A drop-in that sets `MemoryMax` likewise keeps its own value; the
+packaged NVIDIA drop-in sets none.
+
+Version `1.7.0-1`, published as `v1.7.0`, fixed rootless container tools inside
 a remote desktop on top of `1.6.0-1`. The desktop's private `XDG_RUNTIME_DIR`
 and D-Bus bus made rootless podman start a second, empty user namespace:
 containers started from a local or SSH login showed as `Up`, but
@@ -397,10 +422,11 @@ and `v1.0.1` exist without a GitHub release.
 | `1.5.5-1` | — | 2026-10-15 | `dfa3d13` | `26.04.remote2-1` | Published `v1.5.5`: Niri rebase, hardening, rich clipboard, microphone |
 | `1.5.6-1` | — | 2026-10-17 | `c1cdaba` | `26.04.remote2-1` + 0013 | Published `v1.5.6`: headless frame pacing, delay-based H.264 frame window |
 | `1.6.0-1` | — | 2026-10-20 | `470247a` | `26.04.remote2-1` + 0013 | Published `v1.6.0`: 44.1 kHz stereo PCM for mstsc, earned audio drift skip, audio settings |
-| `1.7.0-1` | — | 2026-11-05 | this release | — | `v1.7.0`: rootless container tools (podman, distrobox) in remote desktops, container GUI and audio on the remote desktop, Plasma menu prefix, next login after a Plasma logout (leftover session processes, stale logind session lists) |
+| `1.7.0-1` | — | 2026-11-05 | `c3c2426` | — | `v1.7.0`: rootless container tools (podman, distrobox) in remote desktops, container GUI and audio on the remote desktop, Plasma menu prefix, next login after a Plasma logout (leftover session processes, stale logind session lists) |
+| `1.8.0-1` | — | 2026-11-11 | this release | — | `v1.8.0`: delay-tolerant video rate control, encoder quantiser floor (`KDE_RDP_MIN_QP`), still-screen refinement until settled, periodic keyframe default 3600 s and gated encoder rate changes, SHM capture pool release, heap trimming and memory diagnostics, `MemoryMax=1536M`, no DDC/CI monitor probing in remote sessions |
 
 `kde-rdp-headless` `26.04.remote1-7` does not appear in any commit. The
-PKGBUILDs and `scripts/prepare-release.py` carry `pkgver=1.7.0`/`pkgrel=1`. Bump the version again before
+PKGBUILDs, the Bazzite spec and `scripts/prepare-release.py` carry version `1.8.0` (`pkgrel=1`). Bump the version again before
 building or publishing later changes, so packages with different contents never
 share a version.
 

@@ -26,7 +26,7 @@
 %global kde_rdp_target %{?kde_rdp_target_dir}%{!?kde_rdp_target_dir:%{_builddir}/%{name}-%{version}/bridge/target}
 
 Name:           kde-remote-login
-Version:        1.7.0
+Version:        1.8.0
 Release:        %{?kde_rdp_release}%{!?kde_rdp_release:1}%{?dist}
 Summary:        KDE Plasma remote desktop host (KWin virtual backend) with a PAM/logind broker
 # Bridge source is MIT; the combined binary links GPL-licensed FFmpeg.

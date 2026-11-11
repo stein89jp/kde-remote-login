@@ -55,9 +55,12 @@ would first need a licensing review, for example building against Fedora's
 
 ## Source for the published installer
 
-Release `v1.7.0` carries the `1.7.0-1` installer
-(`kde-remote-login-1.7.0-1-x86_64.pkg.tar.zst`), built from the source tagged
-`v1.7.0`. It adds the rootless container-tool fix for remote desktops to the
+Release `v1.8.0` carries the `1.8.0-1` installer
+(`kde-remote-login-1.8.0-1-x86_64.pkg.tar.zst`), built from the source tagged
+`v1.8.0`. It adds the delay-tolerant video rate control, the encoder quantiser
+floor, still-screen refinement, rarer keyframes, the frontend memory changes
+and the DDC-probing fix of 2026-11-11 to the 1.7.0 release, which added the
+rootless container-tool fix for remote desktops to the
 1.6.0 release, which added the 44.1 kHz stereo PCM audio fix, the earned audio drift
 skip and new audio settings to the headless frame-pacing patch and the
 delay-based H.264 frame window of 1.5.6, the compositor rebase onto upstream Niri `main`, microphone
@@ -65,15 +68,15 @@ redirection, image and HTML clipboard, login, PAM and TLS hardening and the
 NVENC tuning of 1.5.5, along with the README's author section and MIT copyright
 notice for Rikard Stein.
 
-Download these files from the [release](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.7.0):
+Download these files from the [release](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.8.0):
 
-- [Matching source-build bundle](https://github.com/stein89jp/kde-remote-login/releases/download/v1.7.0/kde-remote-login-1.7.0-1.src.tar.gz).
-- [Dependency-source index](https://github.com/stein89jp/kde-remote-login/releases/download/v1.7.0/DEPENDENCY-SOURCES.json).
-- [License texts and third-party notices](https://github.com/stein89jp/kde-remote-login/releases/download/v1.7.0/THIRD-PARTY-NOTICES.txt).
-- [README with author attribution](https://github.com/stein89jp/kde-remote-login/releases/download/v1.7.0/README.md) and [MIT license](https://github.com/stein89jp/kde-remote-login/releases/download/v1.7.0/LICENSE), also included in the installer and source bundle.
-- [SHA256SUMS](https://github.com/stein89jp/kde-remote-login/releases/download/v1.7.0/SHA256SUMS), covering the installer and these source/notice assets.
+- [Matching source-build bundle](https://github.com/stein89jp/kde-remote-login/releases/download/v1.8.0/kde-remote-login-1.8.0-1.src.tar.gz).
+- [Dependency-source index](https://github.com/stein89jp/kde-remote-login/releases/download/v1.8.0/DEPENDENCY-SOURCES.json).
+- [License texts and third-party notices](https://github.com/stein89jp/kde-remote-login/releases/download/v1.8.0/THIRD-PARTY-NOTICES.txt).
+- [README with author attribution](https://github.com/stein89jp/kde-remote-login/releases/download/v1.8.0/README.md) and [MIT license](https://github.com/stein89jp/kde-remote-login/releases/download/v1.8.0/LICENSE), also included in the installer and source bundle.
+- [SHA256SUMS](https://github.com/stein89jp/kde-remote-login/releases/download/v1.8.0/SHA256SUMS), covering the installer and these source/notice assets.
 
-The earlier [`v1.6.0`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.6.0), [`v1.5.6`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.5.6), [`v1.5.5`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.5.5) and [`v1.5`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.5) releases keep their `1.6.0-1`, `1.5.6-1`, `1.5.5-1` and `1.5-1` installers, each with
+The earlier [`v1.7.0`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.7.0), [`v1.6.0`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.6.0), [`v1.5.6`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.5.6), [`v1.5.5`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.5.5) and [`v1.5`](https://github.com/stein89jp/kde-remote-login/releases/tag/v1.5) releases keep their `1.7.0-1`, `1.6.0-1`, `1.5.6-1`, `1.5.5-1` and `1.5-1` installers, each with
 its own matching source bundle, dependency-source index, notices and checksums.
 
 The source-build bundle is the preserved `makepkg --allsource` output. It contains
@@ -85,7 +88,7 @@ source index records that identity and the source archive's checksum.
 Extract the bundle and build as an unprivileged user on a prepared Arch builder:
 
 ```sh
-tar -xzf kde-remote-login-1.7.0-1.src.tar.gz
+tar -xzf kde-remote-login-1.8.0-1.src.tar.gz
 cd kde-remote-login
 makepkg
 ```
@@ -111,9 +114,11 @@ The principal upstream sources are:
 | IronRDP | [Commit `7b976a6965c96c76ff949313e174ea55dada8c44`](https://github.com/Devolutions/IronRDP/tree/7b976a6965c96c76ff949313e174ea55dada8c44). |
 | Smithay | [Commit `8a270232f1bfc416c781273c98a3f52a812a0bba`](https://github.com/Smithay/smithay/tree/8a270232f1bfc416c781273c98a3f52a812a0bba). |
 | FFmpeg upstream | [FFmpeg 9.0.2 source archive](https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz). |
-| Arch FFmpeg packaging | [Exact packaging revision `5c4a25f039c060c421a1cd887551d491dff4d55d`](https://gitlab.archlinux.org/archlinux/packaging/packages/ffmpeg/-/tree/5c4a25f039c060c421a1cd887551d491dff4d55d), tagged `2-9.0.2-2`. Its recipe supplies the distribution's source inputs and build configuration. |
+| Arch FFmpeg packaging | [Exact packaging revision `3f75930faf931f559838a9b272c0a9ee1ff8d0b1`](https://gitlab.archlinux.org/archlinux/packaging/packages/ffmpeg/-/tree/3f75930faf931f559838a9b272c0a9ee1ff8d0b1), tagged `2-9.0.2-3`. Its recipe supplies the distribution's source inputs and build configuration. |
 
-These are the current source pins, used by the `1.7.0-1` and `1.6.0-1` source bundles; the
+These are the current source pins, used by the `1.8.0-1` source bundle. The `1.7.0-1` and
+`1.6.0-1` bundles used the same pins with Arch FFmpeg packaging `2-9.0.2-2`
+(revision `5c4a25f039c060c421a1cd887551d491dff4d55d`); the
 `1.5.6-1` and `1.5.5-1` bundles used the same pins (the latter without patch 0013). The
 earlier `1.5-1` source bundle retains the pins it was built from, including Niri `0be60b742762905b7bee1ea67bb5a2fb00859bf0` with two
 maintained patches and Smithay `ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`.

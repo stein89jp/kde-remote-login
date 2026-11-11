@@ -3,7 +3,7 @@
 # Local inputs are copied and checksum-verified by makepkg, never built in place.
 # Export a portable source bundle with makepkg --allsource.
 pkgname=kde-remote-login
-pkgver=1.7.0
+pkgver=1.8.0
 pkgrel=1
 pkgdesc='KDE Plasma remote desktop host (KWin virtual backend) with a PAM/logind broker'
 arch=('x86_64')
