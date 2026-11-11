@@ -88,7 +88,11 @@ applications use the remote desktop.
 The worker prepends a session-only `XDG_CONFIG_DIRS` overlay with
 `[Plugins] shakecursorEnabled[$i]=false` in `kwinrc`: KWin's shake-cursor effect
 paints the cursor into screencast frames, and the immutable entry wins over the
-user's kwinrc without writing to `~/.config`. The root-owned
+user's kwinrc without writing to `~/.config`. It also exports
+`POWERDEVIL_NO_DDCUTIL=1`, so powerdevil does not probe the host's `/dev/i2c-*`
+buses for DDC/CI monitors that a virtual output cannot have (about three
+seconds of permission-denied retries per login for accounts outside the `i2c`
+group). The root-owned
 `/etc/kde-rdp/renderer.conf` selects `auto` (default) or `hardware`; `software`
 is refused because KWin's screencast needs GPU compositing, and the worker
 fails clearly when no render node is accessible. GPU access uses the account's

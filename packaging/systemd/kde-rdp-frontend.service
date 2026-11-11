@@ -56,7 +56,19 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 TasksMax=64
-MemoryMax=512M
+# The cgroup charge includes mapped libraries and driver kernel memory, not
+# only the heap. Measured with NVENC at 1080p: the startup preflight alone
+# holds about 285 MiB, a connected session about 340 MiB, and long sessions
+# peaked at 440-510 MiB or reached the former 512M cap. A 4K session adds
+# roughly 250 MiB (capture buffers until GPU capture starts, larger encoder
+# frames; more at 4096x4096), and a 32 MiB clipboard image is buffered about
+# five times while it is converted. 1536M covers their sum with headroom and
+# still bounds a runaway network-facing process. There is deliberately no
+# MemoryHigh: its throttling stalls every thread, video and audio included,
+# while little of this memory is reclaimable but hot library pages. A runaway
+# is better killed and restarted; the broker keeps the desktop for its
+# reconnect grace window.
+MemoryMax=1536M
 
 [Install]
 WantedBy=multi-user.target

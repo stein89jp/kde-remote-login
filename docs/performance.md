@@ -26,12 +26,13 @@ before desktop capture starts.
 | --- | --- |
 | `KDE_RDP_ENCODER` | `bitmap` (default), `nvenc`; NVENC validates the hardware encoder at startup, and clients without a compatible graphics codec receive bitmaps |
 | `KDE_RDP_FPS` | 1–60; a ceiling, default 30 for bitmap and 60 for NVENC |
-| `KDE_RDP_BITRATE_MBPS` | 1–100; video ceiling, default 12. Adaptation uses 6 quantized levels down to 1 Mbps; decreases at most once per second, increases after 10 s healthy, applied at the next due IDR or within 30 s |
+| `KDE_RDP_BITRATE_MBPS` | 1–100; video ceiling, default 12. Adaptation uses 6 quantized levels down to 1 Mbps; sustained delivery delay lowers the level at most once per second (one delayed flight alone does not), 10 s of healthy delivery raises it. The encoder is reconfigured, which costs an IDR, only when the new level changes what it sends (see [rate levels](#rate-levels-and-encoder-reconfiguration)) |
 | `KDE_RDP_LINK_MBPS` | Optional known total link budget, 3–100; reserves 1.7 Mbps for PCM plus framing and sets the video target below the remaining budget |
 | `KDE_RDP_VIDEO_PROFILE` | `speed` (existing p1 default), `balanced` (p4 with spatial AQ), `quality` (p5 with spatial AQ); B frames and lookahead remain disabled |
 | `KDE_RDP_VIDEO_CODEC` | `avc420` (default), `auto`, `avc444`; negotiated client support determines the usable codec, with AVC420 and bitmap fallbacks |
 | `KDE_RDP_GPU_CAPTURE` | `auto` (default with NVENC) or `shm` to force CPU readback; DMA-BUF import/conversion is selected only with a supported capture, GPU and encoder combination; SHM remains the fallback, and bitmap mode always uses SHM |
-| `KDE_RDP_GOP_SECONDS` | 1–3600, default 30; periodic NVENC IDR safety net. Refresh, resize, resume, frame drops and other recovery points still force IDRs immediately |
+| `KDE_RDP_GOP_SECONDS` | 1–3600, default 3600 (30 until 2026-11-11); seconds of encoded frames between periodic NVENC IDRs, so by default there is effectively none. Refresh, resize, resume, frame drops and other recovery points still force IDRs immediately; a periodic IDR recovers nothing over reliable RDPGFX and leaves a settled page visibly soft until it is refined again |
+| `KDE_RDP_MIN_QP` | 1–51, default 18; the lowest H.264 quantiser the encoder may use, for I and P frames alike. Lower values spend bitrate on differences that are not visible, higher values save a little more and soften text: 16 and 20 are the neighbours to compare (see [quantiser floor](#quantiser-floor)). `1` is effectively no floor; still-screen refinement then ends on its frame cap instead of at the floor |
 | `KDE_RDP_GPU_DEVICE` | Optional NVIDIA DRM render node, for example `/dev/dri/renderD128`; otherwise readable render nodes are probed in order. Applies to `auto` GPU capture |
 | `KDE_RDP_SCALE` | `client` or explicit 1.0–5.0; an explicit value takes precedence over client Display Control scale metadata |
 | `KDE_RDP_ADAPTIVE_GRAPHICS` | `1` opts into coordinated FPS, which lowers the cadence with the bitrate level (not below 10); `0` (default) keeps the configured FPS. Either way the graphics credit window follows the measured ACK delay (2–8 frames, see below) |
@@ -39,7 +40,7 @@ before desktop capture starts.
 | `KDE_RDP_AUDIO_CHANNELS` | `stereo` (default) offers stereo PCM first and no mono; `mono` is an opt-in that offers mono PCM (downmixed before resampling) first at the selected rate, then stereo PCM, but 48 kHz mono sounded pitched-up and robotic in Windows 10 mstsc (2026-10-20). Compressed fallbacks are unchanged. Invalid values warn and use `stereo` |
 | `KDE_RDP_AUDIO_RATE` | `44100` (default) offers 44.1 kHz PCM (stereo about 1.41 Mbit/s, 3528-byte 20 ms waves resampled from the 48 kHz capture) first, then 48 kHz stereo PCM; `48000` restores the former 48 kHz-first offer, which mstsc played about 8.8% slow (25 s behind video after 5 minutes). Invalid values warn and use `44100` |
 | `KDE_RDP_AUDIO_DRIFT_PPM` | 0–2000, default 100; the PCM drift skip's allowance for Windows audio clock drift (20 ms per 200 s of continuous sound at 100). Larger values clamp to 2000; invalid values warn and use 100 |
-| `KDE_RDP_DIAGNOSTICS` | `1` enables bounded timing/counter reports, including `idr_frames`, `deferred_rate_increase_frames`, `bitrate_level_decreases` and `bitrate_level_increases`; ordinary operation avoids diagnostic aggregation |
+| `KDE_RDP_DIAGNOSTICS` | `1` enables bounded timing/counter reports, including `idr_frames`, `refinement_frames`, `deferred_rate_increase_frames`, `deferred_rate_decrease_frames` (frames encoded while a level change was not applied to the encoder), `bitrate_level_decreases`, `bitrate_level_increases` and `tolerated_delay_episodes`; ordinary operation avoids diagnostic aggregation |
 
 H.264 frames are limited by a graphics credit window: frames sent but not yet
 acknowledged by the client. It starts at 2 per graphics context and, on each
@@ -50,6 +51,150 @@ congestion. The client's core Frame Acknowledge capability (MS-RDPRFX surface
 commands) does not cap it: RDPGFX has its own acknowledgements. Two fixed
 credits limited Windows 10 mstsc over a ~33 ms RTT internet path to about
 20 fps.
+
+A frame acknowledged later than the delivery budget (the fastest observed
+acknowledgement plus 100 ms, at least 150 ms), a client decoder backlog above
+150 ms of payload, or a frame still unacknowledged past the budget starts a
+delay episode. Since 2026-11-11 one such episode alone is not congestion:
+frames sent before its boundary share its cause. The boundary is the moment
+the episode was noticed or, when no acknowledgement was arriving then, the
+first acknowledgement after it: a stall noticed while it lasts is still in
+progress, and a frame sent into that silence (the next keystroke while
+typing) met the same stall. The episode becomes congestion, shrinking the
+window and lowering the bitrate level, when a frame sent after the boundary is
+late as well, when a new episode begins within 500 ms of the previous one
+ending, or when a frame stays unacknowledged for the budget plus 350 ms, which
+also catches an outage with no acknowledgement at all. A healthy
+acknowledgement of a later frame ends the episode; on a screen that went
+still, that later frame is one refinement frame sent once nothing is in
+flight, and an episode nothing resolved is dropped when the next frame is
+sent after 3 s without one. A tolerated episode leaves the 3 s and 10 s
+recovery timers running and is counted as `tolerated_delay_episodes`. The
+reason is a measurement, not
+a preference: the link of a Windows mstsc client over the internet went silent
+for 80–170 ms about once a minute, and earlier that day for a few minutes
+every one to three seconds, then delivered everything at once
+(acknowledgements arrived up to 370 ms late). No lower rate prevents that, yet
+each stall used to cost a window step and a bitrate level, and frequent ones
+held an otherwise healthy 35 ms path at two credits and 1 Mbit/s. The price is
+a later first reaction to sustained delay: in the delivery model
+(`controller-bench`) the first reduction after a sudden, lasting 400 ms delay
+comes 0.4–0.75 s after it starts instead of about 0.2 s (up to 0.9 s when
+frames are 100 ms or more apart, because it needs a frame sent after the
+first late acknowledgement), and the reductions after it keep their pace. Sound pressure reported by the audio path is not
+filtered this way: it shrinks the window and lowers the level at once, as
+before, so link stalls during playback still reduce video through that path.
+
+### Quantiser floor
+
+Without a floor NVENC keeps lowering the quantiser while the picture is easy
+to encode and spends most of its bitrate on differences nobody can see.
+Measured on an RTX 4070 Ti at 1920×1080, 60 fps and the 12 Mbit/s ceiling
+(AVC420, p1, one-frame VBV, synthetic desktop pages and clips, every frame
+decoded and compared with the encoder's input; `Y` is luma PSNR, a tile is
+64×64 pixels):
+
+| `KDE_RDP_MIN_QP` | Settled grey text, worst tile Y | Settled coloured text, worst tile Y / chroma | Photo pan, Mbit/s (mean Y) | Scrolling text, Mbit/s | Bytes to settle after a text page switch |
+| --- | --- | --- | --- | --- | --- |
+| none | 47.7–48.6 dB | 46.6 / 54.4 dB | 5.76 (55.0 dB) | 2.04 | 179 kB |
+| 16 | 44.9–45.3 dB | 43.5 / 43.1 dB | 1.15 (53.8 dB) | 1.65 | 146 kB |
+| **18** | 43.9–44.7 dB | 42.7 / 39.3 dB | 1.05 (53.7 dB) | 1.57 | 141 kB |
+| 20 | 41.4–42.2 dB | 40.3 / 38.5 dB | 1.00 (52.5 dB) | 1.45 | 127 kB |
+
+Typing on the settled coloured page cost 4.41 Mbit/s without a floor (each
+frame re-coded about 9 kB of invisible residue) and 0.10 Mbit/s with one.
+Magnified crops of settled coloured text at none, 18, 22 and 26 could not be
+told apart in this check; that is not a substitute for looking at text through
+mstsc. With AVC444 the floor applies to both views (coloured page at 18: main
+view worst tile 42.8 dB, auxiliary view 43.0 dB, 5.9 instead of 11.7 Mbit/s
+over a page switch). These are encoder measurements: they exclude capture,
+the network and the client's decoder.
+
+### Still-screen refinement
+
+After a change the encoder lowers its quantiser by about one step per frame.
+A page switch is a single capture, so its first frame (29 dB in the
+measurement above, small text partly unreadable) used to stay on screen until
+one refinement frame 750 ms later (37 dB) and was never sharpened further.
+Since 2026-11-11 the frontend keeps encoding the retained image while nothing
+new is captured:
+
+- It starts 100 ms after the last change, so content changing more often
+  than that is never refined between its own frames.
+- It continues until the frame's average quantiser has reached the floor and
+  the frame is no smaller than 0.9 times the previous one at the floor: the
+  encoder has nothing left to add. Frame size alone is not enough, because
+  at low bitrates the encoder pauses with tiny frames far above the floor.
+- The average quantiser does not always reach the floor: with spatial AQ
+  (`balanced`, `quality`) it settled two steps above it, and at 2 Mbit/s rate
+  control held a still page near QP 40. Refinement therefore also ends after
+  16 consecutive frames that bring no new lowest quantiser, are not more than
+  10% smaller than their predecessor and are at most twice the smallest
+  refinement frame so far. The rate-control pauses in the measured
+  convergence runs lasted at most 8 such frames.
+- Without encoder statistics there is one refinement frame, as before.
+- It is bounded by 6 s since the last change and 120 frames and sends no
+  faster than the frame rate or the current bitrate level allows. It needs a
+  quiet path: no decoder backlog, no sound pressure within 3 s, fewer than
+  two unacknowledged frames, one credit left free for a frame the desktop
+  actually changes, and an acknowledgement within the last 3 s (or a client
+  that suspended acknowledgements). During a delay episode it waits until
+  nothing is in flight. It no longer requires a high bitrate level: it runs
+  at every level including the 1 Mbit/s floor, paced at that level. On a
+  constrained link this is traffic next to the PCM audio for up to 6 s after
+  each change.
+- A refinement frame is never an IDR, never reconfigures the encoder and is
+  encoded at the cadence the encoder has, also when coordinated FPS
+  (`KDE_RDP_ADAPTIVE_GRAPHICS=1`) has changed the cadence meanwhile.
+- A capture that was skipped because the credit window was full is kept and
+  sent by the same clock at the next frame interval with a free credit,
+  before any refinement: the client is not left with, or refined towards, an
+  older picture until the next capture or the one-second heartbeat. Only a
+  newer capture or a resize replaces it; pointer updates and the expiry of
+  the refinement do not.
+
+On NVENC a 1080p text page switch settled after 20 refinement frames and
+102 kB at the 12 Mbit/s level (worst tile 44.7 dB), a coloured page after 27
+frames and 291 kB; at the 1 Mbit/s level after 52 and 82 frames (119 and
+302 kB), paced by that level. AVC444 took 15 and 32 frames. `refinement_frames`
+counts them. The retained image is the DMA-BUF or snapshot the stream already
+holds while idle; refinement holds nothing extra.
+
+### Rate levels and encoder reconfiguration
+
+FFmpeg's NVENC wrapper resets rate control and forces an IDR whenever the
+bitrate changes. On a settled text page that IDR measured 29 dB (worst tile
+17 dB) and needed 24–28 frames and about 150 kB to recover, while a lower
+bitrate barely shrinks the frame that a scene change produces (39.7 kB at the
+12 Mbit/s level, 35.0 kB at 4.4, 35.3 kB at 1). The bitrate level is therefore
+applied to the encoder only when that changes what it sends:
+
+- for free whenever an IDR is due anyway (refresh, resume, dropped frame,
+  resize, cadence change) or a new encoder is created;
+- a decrease, when the H.264 payload of the last second exceeded the lower
+  level; after the audio path reported pressure, with the next changed frame
+  whatever the payload, and however much later that frame comes (the urgency
+  lasts until the encoder has adopted a rate at or below the level; refinement
+  frames do not count);
+- an increase, when 30 s have passed since the last IDR (less with a shorter
+  `KDE_RDP_GOP_SECONDS`) and the payload of the last second reached three
+  quarters of the applied rate, so the applied rate is what limits the encoder.
+
+Until then the encoder keeps its rate and the frames are counted as
+`deferred_rate_decrease_frames` or `deferred_rate_increase_frames`. The credit
+window remains the immediate response to congestion.
+
+This has a limit that is accepted, not solved. The decrease gate compares one
+second of payload with the level, so without sound pressure a burst smaller
+than one second of the level (a 1080p page switch is about 1.1 Mbit with its
+refinement) is encoded with the per-frame budget the encoder still has, and
+when content becomes heavy while a decrease is pending the encoder exceeds the
+level for up to about a second before it is reconfigured. On a link that the
+credit window, not the bitrate, is limiting, the encoder keeps the old frame
+budget until the level has fallen below what the link carries. The measurement
+behind accepting this is the one above: reconfiguring barely shrinks a
+scene-change frame (39.7 kB at 12 Mbit/s, 35.0 kB at 4.4, 35.3 kB at 1) and
+costs an IDR.
 
 GPU capture needs the packaged NVIDIA frontend drop-in described in
 [the installation instructions](install.md#optional-nvidia-encoding). It sets
@@ -74,6 +219,13 @@ copies. Compositor damage limits pixel comparisons to the damaged 64-pixel
 tiles; once per second a full comparison audits that damage, and a change found
 outside it forces a full refresh.
 
+With GPU capture, the worker releases the SHM pool when the first DMA-BUF frame
+arrives: unheld buffers are unmapped at once, and a buffer still held as a diff
+base or encoder input is unmapped when its last holder drops it. SHM frames
+that arrive between the renegotiation request and the first DMA-BUF still use
+the pool; a fallback to SHM (GPU failure, resize, minimize) builds a new one on
+its first frame.
+
 With `KDE_RDP_DIAGNOSTICS=1`, capture reports these counters:
 
 | Counter | Meaning |
@@ -82,7 +234,7 @@ With `KDE_RDP_DIAGNOSTICS=1`, capture reports these counters:
 | `capture_full_compares` | SHM frames compared in full: no usable damage, or the once-per-second audit |
 | `capture_changed_tiles` | Changed 64-pixel tiles found by those comparisons |
 | `capture_damage_missed` | Audits that found changed pixels outside the reported damage; each forces a full refresh and should stay 0 |
-| `capture_pool_exhausted` | SHM captures that used the overflow buffer and copied because every pooled buffer was held |
+| `capture_shm_pool_releases` | SHM capture pools released because GPU (DMA-BUF) capture took effect; about one per switch to GPU capture |
 
 Each served connection, including failed TLS handshakes and abrupt TCP drops,
 ends with one always-on `RDP connection summary` journal line, independent of
@@ -163,6 +315,37 @@ and capture state. TCP keepalive and a 20-second outstanding-write timeout detec
 silent loss independently of idle desktop pixels or suspended graphics ACKs.
 The broker's retention (`grace_seconds`, default 45 seconds) still starts at
 observed lease detachment.
+
+### Process memory
+
+The frontend fixes glibc's `M_MMAP_THRESHOLD` at its 128 KiB default at
+startup, so buffers above it are mmapped and returned to the kernel when freed.
+Otherwise the NVENC preflight and each encoder close raise glibc's dynamic
+threshold, and frame-sized buffers then stay resident in the heap after they
+are freed. The frontend's `kde-rdp-memory` thread also runs `malloc_trim(0)`
+after the preflight and about 2 s after a client disconnect, at most once per
+30 s, never per frame and never on the RDP runtime thread.
+
+With `KDE_RDP_DIAGNOSTICS=1`, that thread logs `RDP performance` lines with
+`"component":"memory"`: `"event":"start"` after the preflight, `"periodic"`
+every 60 s, and `"disconnect"` with each trim (about 2 s after a disconnect, or
+up to 30 s when disconnects follow each other).
+
+| Object | Source | Fields |
+| --- | --- | --- |
+| `process` | `/proc/self/status` | `rss_bytes`, `rss_anon_bytes`, `rss_file_bytes`, `rss_shmem_bytes`, `rss_peak_bytes` (VmHWM), `swap_bytes`, `threads` |
+| `heap` | glibc `mallinfo2` | `arena_bytes`, `in_use_bytes`, `free_bytes`, `top_releasable_bytes`, `mmapped_bytes`, `mmapped_chunks` |
+| `cgroup` | the service's cgroup | `current_bytes`, `peak_bytes`, `max_bytes`, `high_bytes`, `swap_bytes`; from `memory.stat`: `anon_bytes`, `anon_thp_bytes`, `file_bytes`, `file_mapped_bytes`, `shmem_bytes`, `kernel_bytes`, `sock_bytes`; from `memory.events`: `events_high`, `events_max`, `events_oom_kill` |
+| `trim` | start and disconnect lines only | `released_bytes` (RssAnon before minus after the trim), `duration_us` |
+
+Sizes are bytes; `null` means unreadable and `"max"` means no limit.
+`MemoryMax` (1536M in the packaged unit) limits the cgroup values, not the RSS:
+`rss_shmem_bytes` includes KWin's screencast buffers, which KWin's cgroup pays
+for, and `kernel_bytes` (driver memory) is charged to the service but is not in
+its RSS. `free_bytes` counts free heap chunks whether or not they are resident,
+so it stays high after a trim; read retained memory from `rss_anon_bytes` and
+`anon_bytes`. On a healthy host `events_max` and `events_oom_kill` stay 0 and
+`anon_bytes` returns to about its start value after each disconnect.
 
 ## Measurements
 
@@ -250,6 +433,12 @@ accurate corners/center/drag, cursor shape/hotspot/hide/animation, Japanese/emoj
 text, HTML and image clipboard in both directions, portrait/landscape resize, minimize/resume,
 blackholed network loss and retained-desktop reconnect. Compare colored one-pixel
 edges and settled text with AVC444 and AVC420 fallback.
+
+The 2026-11-11 video changes (quantiser floor, still-screen refinement, no
+periodic IDR, gated encoder reconfiguration, tolerated delay episodes) have
+encoder, unit and model evidence only. Their mstsc checks are listed in
+[acceptance](acceptance.md) and in the
+[validation entry](validation.md#video-rate-latch-quantiser-floor-still-screen-refinement-and-keyframes-2026-11-11).
 
 Keep the established PCM combination and listen to speech/music after reconnect.
 Run at least 30 minutes each of Firefox/YouTube and VLC flash/tone content,

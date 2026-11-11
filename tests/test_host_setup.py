@@ -61,6 +61,15 @@ class HostSetupTests(unittest.TestCase):
         # The NVIDIA driver reads /proc/driver/nvidia and may map executable memory.
         self.assertNotIn("MemoryDenyWriteExecute", service)
         self.assertNotIn("ProcSubset", service)
+        # The memory limit lives in the base unit, which upgrades replace (the
+        # NVIDIA drop-in is a hand-made copy), and budgets above the measured
+        # 512M long-session peak; no MemoryHigh throttles the stream.
+        self.assertEqual(service.get("MemoryMax"), "1536M")
+        self.assertNotIn("MemoryHigh", service)
+        nvidia = configparser.ConfigParser(interpolation=None, strict=False)
+        nvidia.read(ROOT / "packaging/nvidia-frontend.conf")
+        for key in ("MemoryMax", "MemoryHigh"):
+            self.assertNotIn(key, nvidia["Service"], key)
         lines = (ROOT / "packaging/nvidia-frontend.conf").read_text().splitlines()
         self.assertEqual([line.split("=", 1)[1] for line in lines if line.startswith("DeviceAllow=")],
                          ["char-nvidia rw", "char-nvidiactl rw", "char-nvidia-modeset rw",
@@ -796,6 +805,16 @@ class HostSetupTests(unittest.TestCase):
         self.assertEqual(environment["HOME_CONFIG"], "absent")
         result = self.run_worker("auto")
         self.assertTrue(self.worker_environment(result)["XDG_CONFIG_DIRS"].endswith("/xdg-config:/etc/xdg"))
+
+    def test_worker_disables_ddc_monitor_probing_for_the_remote_session_only(self):
+        # powerdevil must not probe the host's physical monitors over DDC/CI
+        # from a virtual-output session; the switch is an environment variable
+        # of this session, never a configuration file of the account.
+        result = self.run_worker("auto", input_environment={"POWERDEVIL_NO_DDCUTIL": ""})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = self.worker_environment(result)
+        self.assertEqual(environment["POWERDEVIL_NO_DDCUTIL"], "1")
+        self.assertEqual(environment["HOME_CONFIG"], "absent")
 
     def test_worker_rejects_invalid_policy_without_executing_shell_text(self):
         result = self.run_worker("auto; echo unsafe")

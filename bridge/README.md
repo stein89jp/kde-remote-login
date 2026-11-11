@@ -140,7 +140,7 @@ Color conversion uses up to four FFmpeg workers for larger desktops. A padded
 BGR staging frame enables parallel conversion; small or single-core frames use
 direct conversion with only the final rows copied to SIMD-safe scratch memory.
 NVENC uses its fastest preset, ultra-low-latency tuning, no B frames/lookahead,
-single-pass bounded VBR and a one-frame VBV buffer.
+single-pass bounded VBR, a one-frame VBV buffer and a quantiser floor.
 
 Unchanged desktop pixels skip conversion, GPU upload and transmission. Capture
 heartbeats continue so decoder recovery, minimize/resume and channel negotiation
@@ -148,13 +148,31 @@ can request a new IDR even on a static desktop. Encoding keeps one pending task
 and graphics backpressure bounds unacknowledged frames. Set
 `KDE_RDP_BITRATE_MBPS=1..100` sets the H.264 bitrate ceiling (default 12 Mbps).
 Each connection adapts bitrate toward a 1 Mbps floor when graphics ACK latency
-rises above its baseline, acknowledgements stall, or the client reports a
-decoding backlog, moving between six quantized levels: at most one decrease per
-second, and an increase only after 10 seconds of healthy delivery, applied at
-the next due keyframe or within 30 seconds, because each NVENC rate change costs
-a keyframe. Periodic keyframes are a 30-second safety net
-(`KDE_RDP_GOP_SECONDS`); recovery points still force them immediately. The
-encoder is not recreated for a rate change. Tracking stays bounded
+stays above its baseline, acknowledgements stall, or the client keeps reporting
+a decoding backlog, moving between six quantized levels: at most one decrease
+per second, and an increase only after 10 seconds of healthy delivery. One
+delayed flight of frames is not congestion: a link stall delays every frame in
+flight and no lower rate prevents it, so a reduction needs a frame sent after
+the delay began (after its first acknowledgement, when none was arriving) to
+be late as well, two such episodes within 500 ms, or a frame unacknowledged for
+the budget plus 350 ms. Sound pressure from the audio path
+still reduces at once. Because each NVENC rate change costs a keyframe, the
+level reaches the encoder only when it changes what the encoder sends: when a
+keyframe is due anyway, for a decrease when the last second of payload exceeded
+the lower level (after sound pressure: with the next changed frame, however
+late it comes), for an increase after 30 seconds
+without a keyframe when the applied rate is what limits the encoder. The
+encoder is not recreated for a rate change. There is effectively no periodic
+keyframe (`KDE_RDP_GOP_SECONDS`, default 3600); recovery points still force
+one immediately. `KDE_RDP_MIN_QP` (default 18) is the lowest quantiser the
+encoder may use, which stops it spending most of its bitrate on invisible
+detail. A screen that stops changing is sharpened: 100 ms after the last
+change the retained image is encoded again, without keyframes, until the
+quantiser is at that floor and the frames stop shrinking, or 16 frames in a
+row improve nothing, within the bitrate level (every level, including the
+floor) and with one graphics credit always left free; a capture skipped for
+want of a credit is sent by the same clock first. See
+[performance controls](../docs/performance.md#quantiser-floor). Tracking stays bounded
 and resets for reconnects; the graphics acknowledgement-suspension sentinel is
 handled as a protocol mode. Bitmap fallback retains its existing transport.
 See [installation](../docs/install.md#optional-nvidia-encoding) for GPU access and

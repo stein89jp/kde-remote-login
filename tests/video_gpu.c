@@ -35,13 +35,14 @@ int main(int argc,char **argv) {
         struct niri_video *cpu=niri_video_new(w,h,1,60,12000000,error,sizeof(error));
         assert(gpu&&cpu);
         /* Promotion replaces the SHM context through the same NVENC setup,
-           carrying an adapted bitrate and the long GOP. */
+           carrying an adapted bitrate, the long GOP and the quantiser floor. */
         assert(niri_video_set_bitrate(gpu,8000000)==0);
         gpu->gpu=video_gpu_new(gpu,st.st_rdev,error,sizeof(error));
         if(!gpu->gpu){fprintf(stderr,"GPU initialization: %s\n",error);return 1;}
         assert(gpu->codec->pix_fmt==AV_PIX_FMT_CUDA&&gpu->codec->bit_rate==8000000);
         assert(gpu->codec->rc_max_rate==8000000&&gpu->codec->rc_buffer_size==8000000/60);
         assert(gpu->codec->gop_size==NIRI_VIDEO_DEFAULT_GOP_SECONDS*60&&gpu->codec->max_b_frames==0);
+        assert(gpu->codec->qmin==NIRI_VIDEO_DEFAULT_MIN_QP);
         struct niri_gpu *g=gpu->gpu;assert(gpu_current(g));
         uint64_t modifier=gbm_bo_get_modifier(bo);
         EGLint attrs[]={EGL_WIDTH,w,EGL_HEIGHT,h,EGL_LINUX_DRM_FOURCC_EXT,GBM_FORMAT_XRGB8888,
@@ -65,6 +66,8 @@ int main(int argc,char **argv) {
             fprintf(stderr,"GPU conversion failed: %s\n",error);return 1;
         }
         assert(main_size>0&&aux_size==0);
+        /* The GPU-surface encoder reports its frame quantiser, at or above the floor. */
+        assert(niri_video_quantizer(gpu)>=NIRI_VIDEO_DEFAULT_MIN_QP&&niri_video_quantizer(gpu)<=NIRI_VIDEO_MAX_QP);
         assert(!gpu->frame&&!gpu->rgb&&!gpu->full_chroma&&!gpu->auxiliary&&!gpu->scale&&!gpu->tail);
         /* A resumed SHM stream must recreate an IDR encoder, never dereference
            CPU staging released when this encoder adopted GPU surfaces. */

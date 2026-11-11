@@ -114,12 +114,12 @@ pub(super) const SHARED_SLOTS: usize = 3;
 /// snapshot (the latest desktop, a diff base or an encoder input) is never
 /// written again; when every slot is held, the frame is copied into a fresh
 /// private allocation instead.
-pub(super) struct CapturePool {
-    pub(super) layout: ShmLayout,
+struct CapturePool {
+    layout: ShmLayout,
     slots: Vec<Arc<ShmSlot>>,
 }
 impl CapturePool {
-    pub(super) fn new(layout: ShmLayout) -> Self {
+    fn new(layout: ShmLayout) -> Self {
         Self {
             layout,
             slots: Vec::new(),
@@ -155,7 +155,7 @@ impl CapturePool {
     /// Copy one frame (`stride * height` bytes in the pool's layout) and
     /// snapshot it. A pooled slot is shared zero-copy and returns the owner
     /// that vouches for the slot's change history.
-    pub(super) fn capture(
+    fn capture(
         &mut self,
         pixels: &[u8],
         desktop: DesktopSize,
@@ -201,6 +201,43 @@ impl CapturePool {
             ShmTarget::Shared(index) => Arc::strong_count(&self.slots[index]) > 1,
             ShmTarget::Scratch => false,
         }
+    }
+}
+
+/// A stream's SHM capture pool, present only while SHM frames arrive. The
+/// first SHM frame of a layout creates it; a new layout replaces it. Once GPU
+/// capture is in effect KWin fills DMA-BUFs instead and the slots (8.3 MB
+/// each at 1080p, 33 MB at 4K) would otherwise stay mapped for the rest of
+/// the session, so the worker releases the pool then. A later fallback to
+/// SHM builds a fresh pool on its first frame.
+#[derive(Default)]
+pub(super) struct ShmCapture {
+    pool: Option<CapturePool>,
+}
+impl ShmCapture {
+    /// Copy one frame of `layout` and snapshot it, as [`CapturePool`] does.
+    pub(super) fn capture(
+        &mut self,
+        layout: ShmLayout,
+        pixels: &[u8],
+        desktop: DesktopSize,
+    ) -> anyhow::Result<(ShmTarget, BitmapUpdate, Option<SnapshotOwner>)> {
+        if self.pool.as_ref().is_none_or(|pool| pool.layout != layout) {
+            self.pool = Some(CapturePool::new(layout));
+        }
+        self.pool.as_mut().unwrap().capture(pixels, desktop)
+    }
+    /// Drop the pool; true when there was one. A slot nobody holds is
+    /// unmapped at once. A slot that a delivered snapshot still holds (the
+    /// latest desktop, a diff base, an encoder input) stays mapped and
+    /// unchanged: the snapshot's `Bytes` owns an `Arc` of it, and the last
+    /// clone to drop unmaps it and retires its capture-log history.
+    pub(super) fn release(&mut self) -> bool {
+        self.pool.take().is_some()
+    }
+    #[cfg(test)]
+    fn slots(&self) -> usize {
+        self.pool.as_ref().map_or(0, CapturePool::slots)
     }
 }
 
@@ -391,6 +428,65 @@ mod tests {
         assert!(log.changes_between(&next, &reused).is_none());
         drop(reused);
         assert!(!pool.busy(first));
+    }
+
+    #[test]
+    fn released_pool_unmaps_free_slots_keeps_held_snapshots_and_rebuilds_for_shm() {
+        let layout = (WIDTH, HEIGHT, STRIDE);
+        let frame = |value: u8| vec![value; (STRIDE * HEIGHT) as usize];
+        let retired = |owner: &SnapshotOwner| owner.generation.load(Ordering::Acquire) == u64::MAX;
+        let mut shm = ShmCapture::default();
+        assert!(!shm.release(), "no pool before the first SHM frame");
+        // SHM frames before the first DMA-BUF one; the encoder still holds
+        // the first as its last input.
+        let (_, held, held_owner) = shm.capture(layout, &frame(1), DESKTOP).unwrap();
+        let (_, free, free_owner) = shm.capture(layout, &frame(2), DESKTOP).unwrap();
+        let (held_owner, free_owner) = (held_owner.unwrap(), free_owner.unwrap());
+        drop(free);
+        assert_eq!(shm.slots(), 2);
+        // GPU capture took effect.
+        assert!(shm.release());
+        assert_eq!(shm.slots(), 0);
+        assert!(!shm.release());
+        assert!(retired(&free_owner), "an unheld slot is unmapped at once");
+        assert!(
+            !retired(&held_owner),
+            "a held snapshot keeps its slot mapped"
+        );
+        assert_eq!(
+            held_owner.generation.load(Ordering::Acquire),
+            held_owner.value,
+            "and unchanged, so its capture-log history stays valid"
+        );
+        assert!(filled(&held, 1));
+        // A fallback to SHM builds a fresh pool that never writes the slot
+        // the old snapshot still reads.
+        let (target, next, owner) = shm.capture(layout, &frame(3), DESKTOP).unwrap();
+        assert_eq!(target, ShmTarget::Shared(0));
+        assert!(owner.is_some());
+        assert_ne!(next.data.as_ptr(), held.data.as_ptr());
+        assert!(filled(&held, 1) && filled(&next, 3));
+        assert_eq!(shm.slots(), 1);
+        drop(held);
+        assert!(
+            retired(&held_owner),
+            "the last holder unmapped the old slot"
+        );
+        assert!(filled(&next, 3));
+    }
+
+    #[test]
+    fn a_new_layout_replaces_the_pool() {
+        let mut shm = ShmCapture::default();
+        let frame = vec![4u8; ((STRIDE + 64) * HEIGHT) as usize];
+        let (_, first, _) = shm
+            .capture((WIDTH, HEIGHT, STRIDE), &frame, DESKTOP)
+            .unwrap();
+        let (_, padded, _) = shm
+            .capture((WIDTH, HEIGHT, STRIDE + 64), &frame, DESKTOP)
+            .unwrap();
+        assert_eq!(shm.slots(), 1, "the old layout's slots left with its pool");
+        assert!(filled(&first, 4) && filled(&padded, 4));
     }
 
     #[test]

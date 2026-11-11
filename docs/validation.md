@@ -24,6 +24,229 @@ entries below. Their results are automated, namespace, lab and package checks;
 the user confirmed the installed-host Windows 10 mstsc checks for this release
 in [acceptance](acceptance.md) on 2026-10-17.
 
+## Video rate latch, quantiser floor, still-screen refinement and keyframes, 2026-11-11
+
+Unreleased; real-client validation is pending (see the last bullets). Evidence
+is under `artifacts/video-2026-11-11/`: the harness sources, their outputs and
+a compressed `tcp_info` trace (counters only).
+
+- Finding: with `KDE_RDP_DIAGNOSTICS=1` on the installed 1.7.0 host, a day of
+  Windows mstsc use over the internet (TCP RTT 22–35 ms, 1080p, NVENC AVC420,
+  60 fps, 12 Mbit/s ceiling) showed the graphics credit window at 2 and the
+  bitrate at the 1 Mbit/s floor for minutes on a healthy path (11:15–11:17:
+  about 36 fps, acknowledgement median 35 ms, empty decoder queue, yet a
+  200–366 ms acknowledgement in every 5 s interval). Until 13:41 that day,
+  130 of 3832 feedback intervals had an acknowledgement above 150 ms, and
+  5.4 hours of video carried 716 IDRs against 183 bitrate level decreases, 183
+  increases and 77 audio-delay reductions. Separately, a still screen stayed
+  as soft as its last frame, and each IDR on a settled page visibly softened
+  it.
+- Cause of the latch: every single late acknowledgement, over-budget decoder
+  queue or overdue frame was congestion and reset the health timers
+  (`AdaptiveBitrate::acknowledged`, `check_stall`), so one late frame every
+  3 s held the window at 2 and one every 10 s held the level. The late frames
+  are real: an unprivileged `tcp_info` sampler on the live connection (about
+  2 ms resolution, 28 minutes) recorded 25 intervals of 80–170 ms in which no
+  segment at all arrived from the client while 8–50 segments were
+  outstanding, after which everything was acknowledged at once; 23 of them
+  fell within half a second after a minute boundary, and two coincided with
+  `RDP audio delay: receipt 151 ms` lines. Retransmissions went from 120 to
+  129 during the trace, so this is not loss. The frontend does not hold frames:
+  the pinned graphics server rejects a frame past the window instead of
+  queueing it, and the frame's send time is taken immediately before its
+  bytes are handed to the connection. What on the client side stalls is not
+  established (a periodic radio event such as a Wi-Fi scan would fit).
+- Change, rate controller: a late flight starts a delay episode and is
+  tolerated; it is congestion when a frame sent after it began is late too,
+  when a new episode starts within 500 ms of the last one ending, or when a
+  frame is unacknowledged for the budget plus 350 ms (4 of the day's 130
+  delayed intervals exceeded 500 ms). Tolerated episodes leave the recovery
+  timers running. The audio path is untouched: sound pressure still shrinks
+  the window and lowers the level at once, **so link stalls during playback
+  still reduce video through the audio path**. Filtering those is a change to
+  the accepted audio combination and needs the user's approval and an mstsc
+  listening check first.
+- Change, quantiser floor: `KDE_RDP_MIN_QP` (1–51, default 18) sets NVENC's
+  minimum QP for I and P frames through the wrapper's own `qmin` option, and
+  `qmin` for the libx264 test encoder; the GPU-surface context inherits it.
+  The encoder's average frame QP is read from the packet statistics.
+- Change, still screen: 100 ms after the last change the retained image is
+  encoded again until its QP is at the floor and the frame is no smaller than
+  0.9 times the previous floor frame, bounded by 6 s, 120 frames, the bitrate
+  level, two unacknowledged frames and one credit always left free; never an
+  IDR. The former single refinement came after 750 ms and only at the upper
+  bitrate levels. A capture skipped because the window was full is now kept
+  and sent by the same clock at the next frame interval with a free credit.
+- Change, keyframes: `KDE_RDP_GOP_SECONDS` defaults to its maximum, 3600 (was
+  30). A bitrate level reaches the encoder, which costs an IDR in FFmpeg's
+  NVENC wrapper, only when an IDR is due anyway, for a decrease when the last
+  second of payload exceeded the lower level or sound reported pressure
+  within 3 s, and for an increase after 30 s without an IDR when the payload
+  reached three quarters of the applied rate.
+- Results, encoder (RTX 4070 Ti, NVIDIA 615.78.08, FFmpeg n9.0.2, 1080p60,
+  12 Mbit/s, one NVENC session per run; `r_q*.txt`): photo pan 5.76 Mbit/s at
+  55.0 dB unfloored, 1.15 at 53.8 dB (16), 1.05 at 53.7 dB (18), 1.00 at
+  52.5 dB (20); settled grey text worst 64×64 tile 47.7–48.6, 44.9–45.3,
+  43.9–44.7 and 41.4–42.2 dB; settled coloured text worst tile luma/chroma
+  46.6/54.4, 43.5/43.1, 42.7/39.3 and 40.3/38.5 dB; typing on the coloured
+  page 4.41 Mbit/s unfloored and 0.10 with a floor. A rate-change IDR on a
+  settled text page measured 29.2 dB (worst tile 16.9 dB) and took 24–28
+  frames and about 150 kB to recover (`r_rate_q18.txt`). With the repository's
+  `video.c` and the refinement criterion (`settle.txt`), a text page switch
+  settled after 20 frames and 102 kB at 12 Mbit/s, 33 at 2.7 and 52 at
+  1 Mbit/s; a coloured page after 27, 57 and 82; AVC444 after 15 and 32. At
+  2.7 and 1 Mbit/s NVENC emitted 79–130 byte frames at QP 28–47 in mid
+  convergence, which is why frame size alone does not end refinement.
+- Results, controller model (`controller-bench rtt link joint stall_ms
+  [period_ms [seconds]]`; "before" is the previous controller built with the
+  same model): a 180 ms stall every 2 s for 108 s at 30 ms RTT left the
+  previous controller 99.9 s at the floor with window 2 and the new one at
+  12 Mbit/s with window 4 and 0 s at the floor; the same at 100 ms RTT, 18
+  against 54 fps in the last 10 s. One 200 or 400 ms stall: mean target after
+  12 s 9.4/9.3 against 12.0 Mbit/s. One 600 ms stall, and stalls every 400 ms,
+  reduce in both. No stall or a constrained 5 Mbit/s link: identical.
+- Results, checks: `distrobox enter rust-dev -- make lint` clean; `cargo test
+  --locked --offline --manifest-path bridge/Cargo.toml` passed (after the
+  review fixes: library 325 tests, 2 ignored; `controller-bench` 33; main 5;
+  integration 1, 7 and 3);
+  `python3 -m unittest discover -s tests` ran 175 tests, 4 skipped, as before
+  the change; `KDE_RDP_TEST_NVENC=1 python3 -m unittest tests.test_native_video`
+  passed its 5 tests on the RTX 4070 Ti (still frame at QP 18, 31 bytes, QP
+  never below 18, IDRs only at the three forced points). New regressions cover
+  the latch (180 ms stall every 2 s from the floor: window regrown within 5 s,
+  ceiling within 50 s, no reduction), a lone 366 ms stall, sustained delay,
+  quick successive episodes, the stall grace, the encoder gate in both
+  directions and under sound pressure, refinement against the measured NVENC
+  sequences, and in the update stream the loop itself, content changing
+  faster than the settle delay, and the skipped capture. The review fixes
+  add: a stall into sparse frames at six frame rates, sustained delay with
+  sparse frames, the sticky sound-pressure cut in the controller and through
+  the update stream after a still screen, a pointer update and the
+  refinement's expiry beside a waiting capture, and refinement under
+  coordinated FPS. The stream and controller tests then ran 400 times in a
+  row with 48 busy loops and a looping copy of the whole suite on the 16
+  cores (load average about 58; loops and tests at nice 19, so they compete
+  with each other and not with the live session): no failure
+  (`stream-test-load.log`).
+- Changed regressions: four tests pinned "one late acknowledgement or backlog
+  reduces" and now use a second late frame (`bitrate_reduces_on_repeated_delay…`,
+  `stable_long_rtt…`, `sustained_empty_queue_path_change…`,
+  `graphics_ack_feedback_changes_rate…`); the single-refinement stream test is
+  replaced by the loop tests; the encoder-gate test replaces "decreases apply
+  at once"; the GOP default assertion is 3600.
+- Review fixes, same day: (1) a target cut by sound pressure stays urgent
+  until the encoder has adopted a rate at or below it, so it arrives with the
+  next changed frame however long the screen was still (the 3 s pressure
+  window alone left the encoder at the old rate after a 4 s pause); refinement
+  frames, a new sound backend and a graphics reset do not use it up. (2) A
+  delay episode noticed while no acknowledgement was arriving starts at the
+  first acknowledgement after it: typing at about 6 fps into a 330 ms stall
+  used to count the next keystroke's frame as a later late frame and lowered
+  the level. (3) A capture waiting for a credit is superseded only by a newer
+  capture or a resize, not by pointer updates, and it outlives the refinement's
+  expiry. (4) A refinement frame is encoded at the cadence the encoder has, so
+  coordinated FPS (`KDE_RDP_ADAPTIVE_GRAPHICS=1`) cannot recreate the encoder,
+  with an IDR, on a settled page. (5) Refinement also ends after 16 frames in
+  a row that improve nothing, because with spatial AQ and at 2 Mbit/s the
+  average QP never reached the floor; replayed against every recorded NVENC
+  sequence in the evidence directory at the default floor, convergence always
+  ended by the floor rule first, and the longest run of such frames inside a
+  convergence was 8 (coloured page at 1 Mbit/s). (6) The stream tests poll
+  the stream once at a time and compare against recorded instants instead of
+  waiting fixed windows.
+- Cost and limits: the first reduction after a sudden lasting delay comes
+  0.4–0.75 s after it starts in the model instead of about 0.2 s, and up to
+  0.9 s when frames are 100 ms or more apart, since it needs a frame sent
+  after the first late acknowledgement. Without sound pressure the decrease
+  gate compares one second of payload with the level: a burst smaller than
+  that (a 1080p page switch with its refinement is about 1.1 Mbit) is encoded
+  with the frame budget the encoder still has, heavy content can exceed a
+  pending lower level for up to about a second, and on a link limited by the
+  credit window the encoder keeps the old frame budget until the level falls
+  below what the link carries. This is accepted on the measurement that a
+  lower rate barely shrinks a scene-change frame (39.7 kB at 12 Mbit/s,
+  35.0 kB at 4.4, 35.3 kB at 1) while reconfiguring costs an IDR. Refinement
+  now runs at every bitrate level including the floor, paced at that level:
+  about 100 kB after a text page change, and on a constrained link traffic
+  next to PCM audio for up to 6 s after each change. The quantiser floor was
+  judged from PSNR and magnified crops, not through a client.
+- Pending: the user's Windows mstsc validation after the clean reinstall:
+  sharp small grey and coloured text against `KDE_RDP_MIN_QP=1`, 16 and 20;
+  a page switch or scroll stop sharpening within about half a second with no
+  added typing or drag latency; no audio regression during rapid page
+  changes and video; hour-long sessions, minimise/restore, resize and
+  reconnect recovering without periodic IDRs; `idr_frames`, `window_avg` and
+  `tolerated_delay_episodes` in the journal; a throttled link still
+  stepping the bitrate down with bounded delay; and, as part of the
+  constrained-bandwidth listening check, clean sound while pages are switched
+  and scrolling stops, since refinement now sends at the floor level too.
+  Nothing here was tested with a real RDP client.
+
+## Frontend memory limit, heap hygiene and DDC probing, 2026-11-11
+
+Unreleased; the installed-host checks are pending (last bullet). Nothing here
+was tested with a real RDP client or on Bazzite.
+
+- Finding: systemd's records for the installed frontend (NVENC, 1080p, limit
+  `MemoryMax=512M`) show a peak of exactly 512M on 2026-11-06 and 2026-11-10
+  (the second with a 6M swap peak), 484.2M and 499.9M on other long days, and
+  276-285M in nine runs without any client (the NVENC preflight alone). On
+  2026-11-11 the cgroup held about 405 MiB during a session: 194-204 MiB
+  anonymous (about 170 MiB of it transparent huge pages), 125-136 MiB file
+  (mapped NVIDIA, CUDA and FFmpeg libraries) and about 73 MiB kernel memory,
+  flat over minutes, with `memory.events` all 0 and no thread growth across
+  reconnects. No leak was found: the limit sat at the legitimate footprint,
+  and a 4K session was not budgeted.
+- Change: the SHM capture pool is released when the first DMA-BUF frame is
+  accepted (it used to stay mapped for the session: 8.3 MB a slot at 1080p,
+  33 MB at 4K) and is rebuilt on a fallback to SHM. glibc's
+  `M_MMAP_THRESHOLD` is fixed at 128 KiB at startup, and a `kde-rdp-memory`
+  thread runs `malloc_trim(0)` after the preflight and about 2 s after a
+  client disconnect, at most once per 30 s. With `KDE_RDP_DIAGNOSTICS=1` it
+  logs `"component":"memory"` lines ([performance](performance.md)). The
+  packaged unit's limit is `MemoryMax=1536M`, without `MemoryHigh`.
+- Heap evidence (host probes on glibc 2.44, RTX 4070 Ti; sources in the
+  session's scratch area, not kept): after three NVENC create/encode/close
+  rounds at 1080p the process held 41M anonymous memory with the dynamic
+  threshold and 19M with the fixed one; `malloc_trim(0)` returned both to 8M.
+  With the dynamic threshold a freed 1080p buffer stayed resident until a
+  trim; with the fixed one it was unmapped on free.
+- Cost of the fixed threshold on the bitmap paths (600 iterations per pattern,
+  i7-11700K): a zeroed frame-sized output buffer of which 150 kB is written
+  (the RemoteFX handler's pattern) fell from 0.23 ms to 0.03 ms per update; a
+  zeroed two-frame buffer with 1 MB written (the RLE handler) from 0.47 ms to
+  0.22 ms; a fully written 8.3 MB copy (uncompressed surface updates, or a
+  private copy when every pool slot is held) rose from 0.30 ms to 0.96 ms
+  with transparent huge pages `always` (Arch) and to 2.1 ms with them
+  disabled for the process, which approximates Fedora's `madvise` default.
+  The NVENC paths allocate no frame-sized buffer per frame.
+- Limit budget: about 285 MiB preflight, 340-510 MiB for 1080p sessions, about
+  250 MiB more at 4K (three 33 MB capture slots until GPU capture starts and
+  larger encoder frames; estimated from the code, not measured), and a 32 MiB
+  clipboard image held in several copies while it is converted (estimated at
+  about 160 MiB). The sum is about 0.9-1.1 GiB; 1536M leaves headroom and
+  still bounds the process. `MemoryHigh` was rejected because its reclaim
+  throttling stalls every thread of the service, video and audio included.
+- Session: `session-worker` exports `POWERDEVIL_NO_DDCUTIL=1`. On the installed
+  host powerdevil logged six permission-denied retries on `/dev/i2c-1`
+  (3.1 s) at each remote login before its D-Bus services appeared. powerdevil
+  6.8 (`daemon/controllers/ddcutildetector.cpp`, branch `Plasma/6.8`) reads
+  the variable with `qEnvironmentVariableIntValue(...) > 0` before any
+  libddcutil call and then reports no DDC displays.
+- Automated checks: `make lint` clean; bridge library tests 325 passed and 2
+  ignored (9 for the memory module, 4 for the pool release); Python suite 175
+  tests OK with 4 skipped, including the unit-limit and worker-environment
+  assertions; broker 21 groups. The fixed-threshold test runs its checks in a
+  fresh process, because other tests of the same binary leave large free heap
+  chunks behind.
+- Pending on the installed host after a reinstall: the `start` memory line
+  shows `max_bytes` 1610612736; a 1080p GPU-capture session reports
+  `capture_shm_pool_releases` 1 and a lower `anon_bytes` than before;
+  `anon_bytes` returns to about its start value after disconnects instead of
+  ratcheting upward; `events_max` and `events_oom_kill` stay 0 over a long
+  day; a 4K session and a large clipboard image stay well below the limit;
+  the journal shows no `i2c_open_bus_basic` lines at login.
+
 ## Bazzite (Fedora Atomic) package, 2026-11-07
 
 Adds a Bazzite / Fedora Atomic KDE build next to the Arch package:
@@ -633,7 +856,9 @@ record of the 2026-10-18 change.
 - Done: on 2026-10-17 the user confirmed Windows 10 mstsc smoothness on the
   installed host after the reinstall. Limit: a frame captured during
   backpressure is still dropped, and the stream waits for the next capture
-  rather than the ACK.
+  rather than the ACK. (Since the 2026-11-11 change above the newest such
+  capture is kept and sent at the next frame interval with a free credit; the
+  stream still does not wake on the ACK itself.)
 
 ## Microphone redirection (MS-RDPEAI), 2026-10-15
 

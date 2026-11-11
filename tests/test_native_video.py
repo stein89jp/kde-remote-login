@@ -76,9 +76,10 @@ class NativeVideoTests(unittest.TestCase):
             )
             self.assertEqual(decoded.returncode, 0, decoded.stderr.decode())
             self.assertEqual(decoded.stderr, b"", "decoder reference continuity failed")
-            self.assertEqual(len(decoded.stdout), 640 * 368 * 4 * 180)
+            # Three 60-frame rate phases and the 120-frame still phase.
+            self.assertEqual(len(decoded.stdout), 640 * 368 * 4 * 300)
 
-    def test_gop_configuration_and_descriptive_native_errors(self):
+    def test_gop_quantiser_floor_and_descriptive_native_errors(self):
         if not shutil.which("cc") or not shutil.which("pkg-config"):
             self.skipTest("C compiler and FFmpeg development libraries required")
         flags = subprocess.run(

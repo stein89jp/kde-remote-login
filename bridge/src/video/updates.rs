@@ -2,7 +2,7 @@
 //! bitmap fallback and asynchronous encoding.
 use super::encoder::{EncodedFrame, Encoder};
 use super::gfx::{EncodeGate, primary_monitor};
-use crate::performance::{RateApplier, VideoConfig};
+use crate::performance::{RateApplier, Refinement, VideoConfig};
 use crate::server_error;
 use ironrdp_egfx::{pdu::Avc420Region, server::FrameSubmissionError};
 use ironrdp_server::{
@@ -20,7 +20,8 @@ use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
 
 pub(super) type DesktopProvider = Arc<dyn Fn() -> Option<crate::wayland::Desktop> + Send + Sync>;
 /// What an invalidated client reference also discards. Every invalidation
-/// makes the next encoded frame an IDR and cancels a pending refinement.
+/// makes the next encoded frame an IDR and cancels refinement and a capture
+/// waiting for a credit.
 #[derive(Clone, Copy, Default)]
 struct Invalidation {
     /// The bitmap-fallback diff base and its queued tiles.
@@ -54,7 +55,14 @@ pub(super) struct VideoUpdates {
     pub(super) pending_gpu: bool,
     pub(super) gpu_failed: bool,
     pub(super) last_gpu: Option<Arc<crate::wayland::GpuFrame>>,
-    pub(super) refinement: Option<(Instant, Instant)>,
+    /// Clock and convergence state for sharpening the still image, and for
+    /// submitting `skipped` once a credit is free.
+    pub(super) refinement: Option<Refinement>,
+    /// Whether the pending encode is a refinement of the retained image.
+    pub(super) pending_refinement: bool,
+    /// The newest capture, skipped because the credit window was full. It,
+    /// not the older picture the client has, is what goes out next.
+    pub(super) skipped: Option<BitmapUpdate>,
     pub(super) next_frame: Instant,
     pub(super) diagnostics: crate::performance::Telemetry,
     pub(super) credit_wait_started: Option<Instant>,
@@ -74,6 +82,7 @@ impl VideoUpdates {
     fn invalidate_reference(&mut self, scope: Invalidation) {
         self.force_idr = true;
         self.refinement = None;
+        self.skipped = None;
         if scope.fallback {
             self.fallback_previous = None;
             self.fallback_partial.clear();
@@ -221,10 +230,9 @@ impl VideoUpdates {
                 self.rate_applier.idr_sent(Instant::now());
                 self.diagnostics.count("idr_frames", 1);
             }
-            self.diagnostics.count(
-                "h264_payload_bytes",
-                (data.main.len() + data.auxiliary.as_ref().map_or(0, Vec::len)) as u64,
-            );
+            self.rate_applier.submitted(data.payload(), Instant::now());
+            self.diagnostics
+                .count("h264_payload_bytes", data.payload() as u64);
             self.diagnostics.sample("conversion", data.conversion);
             self.diagnostics.sample("encode", data.encode);
             let now = Instant::now();
@@ -272,6 +280,30 @@ impl VideoUpdates {
                 .map_err(|_| server_error("graphics sender closed"))?;
         }
         Ok(())
+    }
+    /// After a frame went through submission: a changed frame starts the
+    /// settle delay, a refinement frame decides whether the image needs
+    /// another. A rejected frame leaves the IDR recovery to the next one.
+    fn schedule_refinement(&mut self, data: &EncodedFrame) {
+        let refinement = std::mem::take(&mut self.pending_refinement);
+        if self.force_idr {
+            return;
+        }
+        let now = Instant::now();
+        let floor = self.config.min_qp as u8;
+        if !refinement {
+            self.refinement = Some(Refinement::armed(data.qp, data.payload(), floor, now));
+            return;
+        }
+        let (target, fps) = {
+            let rate = self.rate.lock().unwrap();
+            (rate.current(), rate.frame_rate())
+        };
+        if self.refinement.as_mut().is_some_and(|refinement| {
+            !refinement.refined(data.qp, data.payload(), floor, target, fps, now)
+        }) {
+            self.refinement = None;
+        }
     }
 }
 #[async_trait::async_trait]
@@ -327,20 +359,71 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                     self.ended = true;
                     return Err(error);
                 }
+                self.schedule_refinement(&data);
             }
-            let timer = self.refinement.map(|(due, _)| due);
+            // Set when the clock, not a capture, asks for the retained image.
+            let mut refining = false;
+            let timer = self.refinement.as_ref().map(|refinement| refinement.due);
             let update = if let Some(due) = timer {
                 tokio::select! {
                     biased;
-                    update=self.inner.next_update()=>update?,
-                    _=tokio::time::sleep_until(due.into())=> {
-                        let now=Instant::now();
-                        let (_,expires)=self.refinement.unwrap();
-                        if now>=expires {self.refinement=None;continue;}
-                        if !self.rate.lock().unwrap().permits_refinement(now) || self.suppressed.load(Ordering::Relaxed) {
-                            self.refinement=Some((now+Duration::from_millis(250),expires));continue;
+                    update = self.inner.next_update() => {
+                        let update = update?;
+                        // Only a newer picture supersedes one waiting for a
+                        // credit; pointer updates pass through beside it.
+                        if matches!(
+                            update,
+                            Some(DisplayUpdate::Bitmap(_) | DisplayUpdate::Resize(_))
+                        ) {
+                            self.skipped = None;
                         }
-                        self.last_image.clone().map(DisplayUpdate::Bitmap)
+                        update
+                    }
+                    _ = tokio::time::sleep_until(due.into()) => {
+                        let now = Instant::now();
+                        let (permitted, in_flight, fps) = {
+                            let rate = self.rate.lock().unwrap();
+                            (rate.permits_refinement(now), rate.in_flight(), rate.frame_rate())
+                        };
+                        let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+                        if self
+                            .refinement
+                            .as_ref()
+                            .is_none_or(|refinement| refinement.expired(now))
+                        {
+                            if self.skipped.is_none() {
+                                self.refinement = None;
+                                continue;
+                            }
+                            // Sharpening the old image has run out of time,
+                            // but a capture still waits for a credit: keep
+                            // the clock for it.
+                            self.refinement = Some(Refinement::waiting(interval, now));
+                        }
+                        let Some(refinement) = self.refinement.as_mut() else {
+                            continue;
+                        };
+                        // Whatever becomes of this tick, the next is a frame
+                        // interval away: no path below can spin.
+                        refinement.postpone(interval, now);
+                        if let Some(image) = self.skipped.take() {
+                            // The newest capture needs only a credit.
+                            Some(DisplayUpdate::Bitmap(image))
+                        } else if permitted && !self.suppressed.load(Ordering::Relaxed) {
+                            let Some(image) = self.last_image.clone() else {
+                                self.refinement = None;
+                                continue;
+                            };
+                            refining = true;
+                            Some(DisplayUpdate::Bitmap(image))
+                        } else {
+                            // Frames in flight clear within a frame or two;
+                            // anything else takes longer.
+                            if in_flight == 0 {
+                                refinement.postpone(Refinement::RETRY, now);
+                            }
+                            continue;
+                        }
                     }
                 }
             } else {
@@ -442,7 +525,21 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                 }
                 if gfx.should_backpressure() {
                     self.diagnostics.count("credit_wait_frames", 1);
-                    self.credit_wait_started.get_or_insert(Instant::now());
+                    let now = Instant::now();
+                    self.credit_wait_started.get_or_insert(now);
+                    // The capture stream only speaks again when the desktop
+                    // changes or after its one-second heartbeat. Keep the
+                    // newest capture and let the refinement clock submit it
+                    // at the next frame interval with a free credit, so the
+                    // client is never left with, or refined towards, an
+                    // older picture.
+                    if !refining && !self.unchanged(&image) {
+                        let interval = Duration::from_secs_f64(1.0 / f64::from(fps));
+                        self.skipped = Some(image);
+                        self.refinement
+                            .get_or_insert_with(|| Refinement::waiting(interval, now))
+                            .hasten(interval, now);
+                    }
                     continue;
                 }
                 if let Some(started) = self.credit_wait_started.take() {
@@ -454,9 +551,9 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                 avc444 = gfx.supports_avc444() && self.config.avc444;
             }
             let now = Instant::now();
-            let (target, fps) = {
+            let (target, fps, urgent) = {
                 let rate = self.rate.lock().unwrap();
-                (rate.current(), rate.frame_rate())
+                (rate.current(), rate.frame_rate(), rate.audio_urgent(now))
             };
             if !self.cadence_due(now) {
                 self.diagnostics.count("cadence_skipped_frames", 1);
@@ -489,23 +586,27 @@ impl RdpServerDisplayUpdates for VideoUpdates {
             // Continue consuming capture heartbeats so capability recovery,
             // minimize/resume and backpressure still wake on a static desktop.
             // Avoid conversion, GPU upload and wire traffic for identical pixels.
-            if self.unchanged(&image) {
-                let eligible = self
-                    .refinement
-                    .is_some_and(|(due, expires)| now >= due && now < expires)
+            // Only the refinement clock re-encodes identical pixels: until
+            // the encoder has nothing left to add, the retained image is
+            // sharpened one frame at a time (see `Refinement`).
+            let refinement = self.unchanged(&image);
+            if refinement {
+                let eligible = refining
+                    && self.refinement.is_some()
                     && self.rate.lock().unwrap().permits_refinement(now);
                 if !eligible {
                     self.diagnostics.count("unchanged_frames", 1);
                     continue;
                 }
-                self.refinement = None;
                 self.diagnostics.count("refinement_frames", 1);
-            } else {
-                self.refinement = Some((
-                    now + Duration::from_millis(750),
-                    now + Duration::from_secs(6),
-                ));
             }
+            // A cadence change recreates the encoder and starts with an IDR.
+            // Joint adaptation moves the cadence with the bitrate level; a
+            // refinement frame keeps the cadence the encoder has.
+            let fps = match self.rate_applier.applied_fps() {
+                Some(applied) if refinement => applied,
+                _ => fps,
+            };
             let (width, height) = (image.width.get(), image.height.get());
             // Acquire asynchronously before submitting blocking work. Dropped
             // streams may retain an already-running native call; replacements
@@ -527,12 +628,24 @@ impl RdpServerDisplayUpdates for VideoUpdates {
             self.next_frame = now + Duration::from_secs_f64(1.0 / f64::from(fps));
             let encoder = self.encoder.clone();
             let force_idr = self.force_idr;
-            let bitrate = self.rate_applier.select(target, fps, force_idr, now);
-            if bitrate != target {
-                self.diagnostics.count("deferred_rate_increase_frames", 1);
+            let bitrate = self
+                .rate_applier
+                .select(target, fps, force_idr, urgent, refinement, now);
+            // A target cut by sound pressure has reached the encoder once it
+            // encodes at or below the target.
+            self.rate.lock().unwrap().rate_adopted(bitrate);
+            match bitrate.cmp(&target) {
+                std::cmp::Ordering::Less => {
+                    self.diagnostics.count("deferred_rate_increase_frames", 1)
+                }
+                std::cmp::Ordering::Greater => {
+                    self.diagnostics.count("deferred_rate_decrease_frames", 1)
+                }
+                std::cmp::Ordering::Equal => (),
             }
             let config = self.config;
             self.pending_gpu = gpu.is_some();
+            self.pending_refinement = refinement;
             self.pending_refresh = self.known_refresh;
             let captured_at = gpu.as_ref().map(|frame| frame.captured_at).or_else(|| {
                 self.desktop
@@ -559,7 +672,8 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                     )?);
                 }
                 let encoder = encoder.as_mut().unwrap();
-                // NVENC rate reconfiguration emits an IDR by itself.
+                // NVENC rate reconfiguration emits an IDR by itself, which
+                // is why `RateApplier` avoids it.
                 let recreated = encoder.set_rate(bitrate, fps)?;
                 let mut encoded = if let Some(gpu) = gpu {
                     encoder.encode_gpu(&gpu, force_idr || changed || recreated)

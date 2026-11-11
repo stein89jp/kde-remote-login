@@ -270,6 +270,7 @@ static struct niri_gpu *video_gpu_new(struct niri_video *v, uint64_t device_id,
     nvenc_configure(v, hardware, bitrate, &options);
     result = avcodec_open2(hardware, codec, &options); av_dict_free(&options);
     if (result < 0) { avcodec_free_context(&hardware); error_text(error,length,"open GPU-surface NVENC",result); goto fail; }
+    if (hardware->qmin != v->min_qp) { avcodec_free_context(&hardware); GPU_FAIL("GPU-surface NVENC ignored the minimum QP"); }
     v->codec = hardware;
     /* A GPU->SHM transition recreates the encoder and starts with an IDR.
        Keeping full RGB/444 CPU staging allocations after promotion would
@@ -331,7 +332,7 @@ int niri_video_encode_dmabuf(struct niri_video *v, int fd, uint32_t fourcc, uint
     if (!v->gpu) { v->gpu = video_gpu_new(v,device_id,error,length); if (!v->gpu) return -1; force_idr = 1; }
     struct niri_gpu *g = v->gpu;
     if (g->device_id != device_id || !gpu_current(g)) { snprintf(error,length,"DMA-BUF device/context mismatch");return -1; }
-    double start = video_now_ms(); v->encode_ms = 0;
+    double start = video_now_ms(); v->encode_ms = 0; v->quantizer = -1;
     glActiveTexture(GL_TEXTURE0);
     struct gpu_image *image = gpu_image_for(g,v,fd,fourcc,stride,offset,modifier,error,length);
     if (!image) { gpu_release(g);return -1; }

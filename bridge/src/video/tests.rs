@@ -110,6 +110,8 @@ fn updates(
             gpu_failed: false,
             last_gpu: None,
             refinement: None,
+            pending_refinement: false,
+            skipped: None,
             next_frame: Instant::now(),
             diagnostics: crate::performance::Telemetry::from_env(),
             credit_wait_started: None,
@@ -864,7 +866,9 @@ fn delivered_idrs_let_a_held_rate_increase_wait_for_the_next_one() {
     advertise(&stream.handle, true);
     let now = Instant::now();
     assert_eq!(
-        stream.rate_applier.select(7_300_000, 60, true, now),
+        stream
+            .rate_applier
+            .select(7_300_000, 60, true, false, false, now),
         7_300_000
     );
     stream.submit(&[0, 0, 0, 1, 0x65], 64, 64).unwrap();
@@ -872,14 +876,14 @@ fn delivered_idrs_let_a_held_rate_increase_wait_for_the_next_one() {
     assert_eq!(
         stream
             .rate_applier
-            .select(12_000_000, 60, false, Instant::now()),
+            .select(12_000_000, 60, false, false, false, Instant::now()),
         7_300_000,
         "a delivered IDR starts the increase hold"
     );
     assert_eq!(
         stream
             .rate_applier
-            .select(12_000_000, 60, true, Instant::now()),
+            .select(12_000_000, 60, true, false, false, Instant::now()),
         12_000_000
     );
 }
@@ -911,80 +915,430 @@ impl RdpServerDisplayUpdates for Channel {
         Ok(self.0.recv().await)
     }
 }
-#[tokio::test(flavor = "current_thread")]
-async fn a_settled_image_refines_once_without_recreating_encoder_or_repeating_idrs() {
+/// The frame id of one submitted H.264 frame and whether it is an IDR.
+fn submitted_frame(event: ServerEvent) -> (u32, bool) {
+    use ironrdp_egfx::pdu::Avc420BitmapStream;
+    let pdus = graphics_pdus(event);
+    let id = pdus
+        .iter()
+        .find_map(|pdu| match pdu {
+            GfxPdu::StartFrame(frame) => Some(frame.frame_id),
+            _ => None,
+        })
+        .unwrap();
+    let idr = pdus.iter().any(|pdu| match pdu {
+        GfxPdu::WireToSurface1(wire) => h264_has_idr(
+            ironrdp_core::decode::<Avc420BitmapStream<'_>>(&wire.bitmap_data)
+                .unwrap()
+                .data,
+        ),
+        _ => false,
+    });
+    (id, idr)
+}
+fn acknowledge(stream: &VideoUpdates, id: u32) {
     use ironrdp_egfx::pdu::{FrameAcknowledgePdu, QueueDepth};
-    let (mut stream, mut events) = updates(vec![]);
+    let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+        frame_id: id,
+        queue_depth: QueueDepth::AvailableBytes(0),
+        total_frames_decoded: id + 1,
+    });
+    stream
+        .handle
+        .lock()
+        .unwrap()
+        .process(7, &ironrdp_core::encode_vec(&ack).unwrap())
+        .unwrap();
+}
+fn shaded_image(shade: u8) -> ironrdp_server::BitmapUpdate {
+    crate::bitmap(
+        &vec![shade; 64 * 64 * 4],
+        64,
+        64,
+        64 * 4,
+        false,
+        DesktopSize {
+            width: 64,
+            height: 64,
+        },
+        false,
+    )
+    .unwrap()
+}
+/// A stream fed through a channel, with the software encoder in place so no
+/// hardware session is opened.
+fn channel_stream() -> (
+    VideoUpdates,
+    tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    tokio::sync::mpsc::Sender<DisplayUpdate>,
+    usize,
+) {
+    let (mut stream, events) = updates(vec![]);
     advertise(&stream.handle, true);
     stream.known_generation = stream.generation.load(Ordering::SeqCst);
-    let DisplayUpdate::Bitmap(image) = image() else {
-        unreachable!()
-    };
     let fps = stream.rate.lock().unwrap().frame_rate();
-    let mut encoder = Encoder::new_rate(64, 64, true, false, fps, 12_000_000).unwrap();
-    let first = encoder.encode_views(&image, true).unwrap();
-    let ptr = encoder.ptr;
+    let encoder = Encoder::new_rate(64, 64, true, false, fps, 12_000_000).unwrap();
+    let pointer = encoder.ptr as usize;
     *stream.encoder.lock().unwrap() = Some(encoder);
-    stream.submit_frame(&first, 64, 64).unwrap();
-    let ack = |stream: &mut VideoUpdates, event| {
-        let id = graphics_pdus(event)
-            .into_iter()
-            .find_map(|pdu| {
-                if let GfxPdu::StartFrame(frame) = pdu {
-                    Some(frame.frame_id)
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-            frame_id: id,
-            queue_depth: QueueDepth::AvailableBytes(0),
-            total_frames_decoded: id + 1,
-        });
-        stream
-            .handle
-            .lock()
-            .unwrap()
-            .process(7, &ironrdp_core::encode_vec(&ack).unwrap())
-            .unwrap();
-    };
-    ack(&mut stream, events.try_recv().unwrap());
-    stream.last_image = Some(image.clone());
-    stream.refinement = Some((
-        Instant::now() + Duration::from_millis(10),
-        Instant::now() + Duration::from_secs(2),
-    ));
     let (sender, receiver) = tokio::sync::mpsc::channel(8);
     stream.inner = Box::new(Channel(receiver));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), stream.next_update())
-            .await
-            .is_err()
-    );
-    let refined = events
-        .try_recv()
-        .expect("exactly one refinement reaches the client");
-    assert!(events.try_recv().is_err());
-    assert!(stream.refinement.is_none());
-    assert_eq!(stream.encoder.lock().unwrap().as_ref().unwrap().ptr, ptr);
-    ack(&mut stream, refined);
-    for _ in 0..8 {
-        sender
-            .send(DisplayUpdate::Bitmap(image.clone()))
-            .await
-            .unwrap();
+    (stream, events, sender, pointer)
+}
+/// How long a stream test waits for something that must happen. Generous:
+/// the package build may run this suite on a busy machine.
+const PATIENCE: Duration = Duration::from_secs(30);
+/// The refinement settle delay.
+const SETTLE: Duration = Duration::from_millis(100);
+/// Poll the stream exactly once and return an update it yields. Time passes
+/// only between polls, so what one poll does cannot depend on how long the
+/// test was descheduled inside a timed wait; and because the test always
+/// queues its next capture before polling again, a capture and an expired
+/// timer never race.
+async fn poll_once(stream: &mut VideoUpdates) -> Option<DisplayUpdate> {
+    tokio::select! {
+        biased;
+        update = stream.next_update() => Some(update.unwrap().unwrap()),
+        _ = std::future::ready(()) => None,
     }
+}
+/// One poll of a stream that has only H.264 work to do.
+async fn step(stream: &mut VideoUpdates) {
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), stream.next_update())
-            .await
-            .is_err()
+        poll_once(stream).await.is_none(),
+        "H.264 frames are not display updates"
     );
+}
+/// Poll until the stream submits a frame.
+async fn next_frame(
+    stream: &mut VideoUpdates,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+) -> (u32, bool) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        step(stream).await;
+        if let Ok(event) = events.try_recv() {
+            return submitted_frame(event);
+        }
+        assert!(Instant::now() < deadline, "no frame within {PATIENCE:?}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+/// Poll until `done`, for conditions the stream must reach by itself.
+async fn until(stream: &mut VideoUpdates, what: &str, done: impl Fn(&VideoUpdates) -> bool) {
+    let deadline = Instant::now() + PATIENCE;
+    while !done(stream) {
+        assert!(Instant::now() < deadline, "{what}: not within {PATIENCE:?}");
+        step(stream).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+/// Keep polling for at least `time`: for things that must not happen however
+/// long the machine takes.
+async fn idle(stream: &mut VideoUpdates, time: Duration) {
+    let end = Instant::now() + time;
+    while Instant::now() < end {
+        step(stream).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+/// Queue the desktop's next capture. Without an authenticated desktop the
+/// stream keeps its own cadence and drops captures that come faster, so wait
+/// out the frame interval first, without polling the stream: the capture is
+/// then queued before any timer of the stream can be looked at.
+async fn capture(
+    stream: &VideoUpdates,
+    sender: &tokio::sync::mpsc::Sender<DisplayUpdate>,
+    shade: u8,
+) {
+    tokio::time::sleep_until(stream.next_frame.into()).await;
+    sender
+        .send(DisplayUpdate::Bitmap(shaded_image(shade)))
+        .await
+        .unwrap();
+}
+fn shade(image: &Option<ironrdp_server::BitmapUpdate>) -> Option<u8> {
+    image.as_ref().map(|image| image.data[0])
+}
+/// Refine the still image to the end, acknowledging every frame; returns the
+/// number of refinement frames, none of which may be an IDR or come before
+/// `earliest`.
+async fn settle(
+    stream: &mut VideoUpdates,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    earliest: Instant,
+) -> usize {
+    let deadline = Instant::now() + PATIENCE;
+    let mut refined = 0;
+    while stream.refinement.is_some() {
+        assert!(Instant::now() < deadline, "the image never settled");
+        step(stream).await;
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                Instant::now() >= earliest,
+                "refined before the settle delay"
+            );
+            let (id, idr) = submitted_frame(event);
+            assert!(!idr, "refinement never sends an IDR");
+            acknowledge(stream, id);
+            refined += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    refined
+}
+/// Two unacknowledged frames fill the initial window; `waiting` is then
+/// captured and has to wait for a credit. Returns the two frame ids.
+async fn full_window_with_a_waiting_capture(
+    stream: &mut VideoUpdates,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    sender: &tokio::sync::mpsc::Sender<DisplayUpdate>,
+    waiting: u8,
+) -> [u32; 2] {
+    let mut frames = [0; 2];
+    for (frame, shade) in frames.iter_mut().zip([40, 90]) {
+        capture(stream, sender, shade).await;
+        *frame = next_frame(stream, events).await.0;
+    }
+    assert!(stream.handle.lock().unwrap().should_backpressure());
+    capture(stream, sender, waiting).await;
+    until(stream, "the capture waits for a credit", |stream| {
+        shade(&stream.skipped) == Some(waiting)
+    })
+    .await;
+    frames
+}
+fn encoder_state(stream: &VideoUpdates) -> (usize, u32, u32) {
+    let encoder = stream.encoder.lock().unwrap();
+    let encoder = encoder.as_ref().unwrap();
+    (encoder.ptr as usize, encoder.bitrate, encoder.fps)
+}
+#[tokio::test(flavor = "current_thread")]
+async fn a_still_image_is_refined_until_the_encoder_settles_without_idrs_or_a_new_encoder() {
+    let (mut stream, mut events, sender, pointer) = channel_stream();
+    let captured = Instant::now();
+    capture(&stream, &sender, 127).await;
+    let (first, idr) = next_frame(&mut stream, &mut events).await;
+    assert!(idr, "a new stream starts with an IDR");
+    assert!(stream.refinement.is_some());
+    acknowledge(&stream, first);
+    // The software encoder reports its quantiser, so the loop runs until a
+    // frame at the floor is no smaller than the one before it. Nothing is
+    // refined before the settle delay, which started no earlier than the
+    // capture.
+    let refined = settle(&mut stream, &mut events, captured + SETTLE).await;
+    assert!(
+        (2..=8).contains(&refined),
+        "{refined} refinement frames for a flat image"
+    );
+    assert_eq!(encoder_state(&stream).0, pointer);
+    // Idle heartbeats of the settled image neither refine nor restart it,
+    // however long they are given.
+    for _ in 0..8 {
+        capture(&stream, &sender, 127).await;
+    }
+    idle(&mut stream, Duration::from_millis(300)).await;
+    assert!(events.try_recv().is_err(), "a settled image is left alone");
+    assert!(stream.refinement.is_none());
+    assert_eq!(encoder_state(&stream).0, pointer);
+}
+#[tokio::test(flavor = "current_thread")]
+async fn content_changing_faster_than_the_settle_delay_is_not_refined_between_its_frames() {
+    let (mut stream, mut events, sender, _) = channel_stream();
+    // Each change is captured as soon as the frame of the one before it is
+    // out, like continuous content, and every frame is acknowledged at once,
+    // so nothing but the settle delay holds refinement back. With no encode
+    // pending and the capture queued before the stream is polled again, the
+    // first frame after a capture is that capture's. Any further frame
+    // before the next capture is a refinement of it: legitimate only when
+    // the image really stood for the settle delay, which a stalled machine
+    // can make happen, and never earlier.
+    let mut refinements = 0;
+    let mut captured = Instant::now();
+    for change in 0..12u8 {
+        assert!(stream.pending.is_none() && events.try_recv().is_err());
+        captured = Instant::now();
+        capture(&stream, &sender, 40 + change * 15).await;
+        let (id, _) = next_frame(&mut stream, &mut events).await;
+        acknowledge(&stream, id);
+        assert_eq!(shade(&stream.last_image), Some(40 + change * 15));
+        loop {
+            while let Ok(event) = events.try_recv() {
+                assert!(
+                    Instant::now() >= captured + SETTLE,
+                    "change {change} was refined before its settle delay"
+                );
+                acknowledge(&stream, submitted_frame(event).0);
+                refinements += 1;
+            }
+            if stream.pending.is_none() {
+                break;
+            }
+            step(&mut stream).await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    // Once the content stops, sharpening starts, and not before the delay.
+    let (_, idr) = next_frame(&mut stream, &mut events).await;
+    assert!(!idr);
+    assert!(Instant::now() >= captured + SETTLE);
+    assert_eq!(shade(&stream.last_image), Some(40 + 11 * 15));
+    // For context only: zero unless the machine stalled the test.
+    eprintln!("refinement frames between changes: {refinements}");
+}
+#[tokio::test(flavor = "current_thread")]
+async fn the_newest_capture_skipped_for_a_credit_goes_out_when_one_is_free() {
+    let (mut stream, mut events, sender, _) = channel_stream();
+    // The third capture is the last one the desktop produces: without it the
+    // client would keep the second picture until the next capture or
+    // heartbeat.
+    let frames = full_window_with_a_waiting_capture(&mut stream, &mut events, &sender, 200).await;
+    idle(&mut stream, Duration::from_millis(150)).await;
     assert!(
         events.try_recv().is_err(),
-        "ordinary idle heartbeats cannot repeatedly refine"
+        "nothing is sent or refined past the window"
     );
-    assert_eq!(stream.encoder.lock().unwrap().as_ref().unwrap().ptr, ptr);
+    assert_eq!(shade(&stream.skipped), Some(200));
+    assert!(!stream.force_idr, "a skipped capture was never encoded");
+    acknowledge(&stream, frames[0]);
+    let (id, idr) = next_frame(&mut stream, &mut events).await;
+    assert!(id > frames[1] && !idr);
+    assert!(stream.skipped.is_none());
+    assert_eq!(
+        shade(&stream.last_image),
+        Some(200),
+        "the newest capture, not a refinement of the older one"
+    );
+    // A newer capture replaces a waiting one.
+    let (mut stream, mut events, sender, _) = channel_stream();
+    let frames = full_window_with_a_waiting_capture(&mut stream, &mut events, &sender, 200).await;
+    capture(&stream, &sender, 250).await;
+    until(&mut stream, "the newer capture waits instead", |stream| {
+        shade(&stream.skipped) == Some(250)
+    })
+    .await;
+    acknowledge(&stream, frames[0]);
+    next_frame(&mut stream, &mut events).await;
+    assert_eq!(shade(&stream.last_image), Some(250));
+    idle(&mut stream, Duration::from_millis(100)).await;
+    assert!(
+        events.try_recv().is_err(),
+        "the superseded capture is never sent"
+    );
+}
+#[tokio::test(flavor = "current_thread")]
+async fn a_pointer_update_does_not_drop_a_capture_waiting_for_a_credit() {
+    let (mut stream, mut events, sender, _) = channel_stream();
+    let frames = full_window_with_a_waiting_capture(&mut stream, &mut events, &sender, 200).await;
+    // The pointer moves while the capture waits: the update passes through.
+    sender.send(DisplayUpdate::HidePointer).await.unwrap();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match poll_once(&mut stream).await {
+            Some(DisplayUpdate::HidePointer) => break,
+            Some(_) => panic!("unexpected update"),
+            None => assert!(Instant::now() < deadline),
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        shade(&stream.skipped),
+        Some(200),
+        "only a newer picture supersedes a waiting capture"
+    );
+    assert!(events.try_recv().is_err());
+    acknowledge(&stream, frames[0]);
+    next_frame(&mut stream, &mut events).await;
+    assert_eq!(shade(&stream.last_image), Some(200));
+}
+#[tokio::test(flavor = "current_thread")]
+async fn a_capture_waiting_for_a_credit_outlives_the_refinement_expiry() {
+    use crate::performance::Refinement;
+    let (mut stream, mut events, sender, _) = channel_stream();
+    let frames = full_window_with_a_waiting_capture(&mut stream, &mut events, &sender, 200).await;
+    // The refinement of the older image runs out of time while the client
+    // still owes an acknowledgement.
+    let long_ago = Instant::now() - Duration::from_secs(7);
+    stream.refinement = Some(Refinement::waiting(Duration::ZERO, long_ago));
+    assert!(stream.refinement.as_ref().unwrap().expired(Instant::now()));
+    idle(&mut stream, Duration::from_millis(50)).await;
+    assert_eq!(shade(&stream.skipped), Some(200), "still waiting");
+    assert!(
+        stream
+            .refinement
+            .as_ref()
+            .is_some_and(|clock| !clock.expired(Instant::now())),
+        "a fresh clock keeps looking for a credit"
+    );
+    assert!(events.try_recv().is_err());
+    acknowledge(&stream, frames[0]);
+    next_frame(&mut stream, &mut events).await;
+    assert_eq!(shade(&stream.last_image), Some(200));
+    // Without a waiting capture an expired refinement simply ends.
+    acknowledge(&stream, frames[1]);
+    stream.refinement = Some(Refinement::waiting(Duration::ZERO, long_ago));
+    idle(&mut stream, Duration::from_millis(20)).await;
+    assert!(stream.refinement.is_none());
+}
+/// A controller whose last level change is long past, so that a reported
+/// sound pressure lowers the level at once.
+fn seasoned_rate(stream: &VideoUpdates, joint: bool) {
+    let mut rate = crate::performance::AdaptiveBitrate::new(
+        12_000_000,
+        Instant::now() - Duration::from_secs(60),
+    );
+    rate.set_frame_rate_ceiling(60);
+    rate.enable_joint_adaptation(joint);
+    *stream.rate.lock().unwrap() = rate;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn a_sound_pressure_cut_reaches_the_encoder_with_the_next_changed_frame_however_late() {
+    let (mut stream, mut events, sender, pointer) = channel_stream();
+    seasoned_rate(&stream, false);
+    let captured = Instant::now();
+    capture(&stream, &sender, 127).await;
+    let (first, _) = next_frame(&mut stream, &mut events).await;
+    acknowledge(&stream, first);
+    assert_eq!(encoder_state(&stream), (pointer, 12_000_000, 60));
+    // Sound reported pressure four seconds ago and the screen has been still
+    // since: the pressure itself has aged out of its 3 s window.
+    let pressure = Instant::now() - Duration::from_secs(4);
+    stream.rate.lock().unwrap().audio_congested(pressure);
+    assert_eq!(stream.rate.lock().unwrap().current(), 7_300_000);
+    // Refinement frames of the still image are held at the encoder's rate
+    // and do not use the cut up.
+    assert!(settle(&mut stream, &mut events, captured + SETTLE).await >= 1);
+    assert_eq!(encoder_state(&stream), (pointer, 12_000_000, 60));
+    assert!(stream.rate.lock().unwrap().audio_urgent(Instant::now()));
+    // The next frame the desktop changes is encoded at the reduced rate,
+    // with no payload in the last second to justify it otherwise.
+    capture(&stream, &sender, 200).await;
+    next_frame(&mut stream, &mut events).await;
+    assert_eq!(encoder_state(&stream), (pointer, 7_300_000, 60));
+    assert!(!stream.rate.lock().unwrap().audio_urgent(Instant::now()));
+}
+#[tokio::test(flavor = "current_thread")]
+async fn refinement_keeps_the_encoder_cadence_when_joint_adaptation_changes_it() {
+    let (mut stream, mut events, sender, pointer) = channel_stream();
+    seasoned_rate(&stream, true);
+    let captured = Instant::now();
+    capture(&stream, &sender, 127).await;
+    let (first, _) = next_frame(&mut stream, &mut events).await;
+    acknowledge(&stream, first);
+    // The level, and with it the coordinated cadence, falls while the screen
+    // is still.
+    let pressure = Instant::now() - Duration::from_secs(4);
+    stream.rate.lock().unwrap().audio_congested(pressure);
+    assert_eq!(stream.rate.lock().unwrap().frame_rate(), 36);
+    // Refinement must not recreate the encoder for the new cadence: that
+    // would be an IDR on a settled page (`settle` rejects IDRs).
+    assert!(settle(&mut stream, &mut events, captured + SETTLE).await >= 1);
+    assert_eq!(encoder_state(&stream), (pointer, 12_000_000, 60));
+    // A changed frame takes the new cadence and rate, with its IDR.
+    capture(&stream, &sender, 200).await;
+    let (_, idr) = next_frame(&mut stream, &mut events).await;
+    assert!(idr);
+    let (_, bitrate, fps) = encoder_state(&stream);
+    assert_eq!((bitrate, fps), (7_300_000, 36));
 }
 #[test]
 fn nonaligned_desktop_encodes_edge_padding_without_stretching() {
@@ -1235,34 +1589,24 @@ fn graphics_ack_feedback_changes_rate_and_new_connections_reset_it() {
     let now = Instant::now();
     *stream.rate.lock().unwrap() =
         crate::performance::AdaptiveBitrate::new(12_000_000, now - Duration::from_secs(2));
-    stream.submit(&[0, 0, 0, 1, 0x65], 64, 64).unwrap();
-    let id = graphics_pdus(events.try_recv().unwrap())
-        .into_iter()
-        .find_map(|pdu| {
-            if let GfxPdu::StartFrame(frame) = pdu {
-                Some(frame.frame_id)
-            } else {
-                None
-            }
-        })
-        .unwrap();
-    stream
-        .rate
-        .lock()
-        .unwrap()
-        .sent(id, now - Duration::from_secs(1));
-    let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-        queue_depth: QueueDepth::AvailableBytes(1_000_000),
-        frame_id: id,
-        total_frames_decoded: 1,
-    });
-    stream
-        .handle
-        .lock()
-        .unwrap()
-        .process(7, &ironrdp_core::encode_vec(&ack).unwrap())
-        .unwrap();
-    assert_eq!(stream.rate.lock().unwrap().current(), 7_300_000);
+    // One frame reporting a decoder backlog is tolerated; a second, sent
+    // after it, makes the backlog congestion.
+    for (frame, expected) in [(0, 12_000_000), (1, 7_300_000)] {
+        stream.submit(&[0, 0, 0, 1, 0x65], 64, 64).unwrap();
+        let (id, _) = submitted_frame(events.try_recv().unwrap());
+        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+            queue_depth: QueueDepth::AvailableBytes(1_000_000),
+            frame_id: id,
+            total_frames_decoded: frame + 1,
+        });
+        stream
+            .handle
+            .lock()
+            .unwrap()
+            .process(7, &ironrdp_core::encode_vec(&ack).unwrap())
+            .unwrap();
+        assert_eq!(stream.rate.lock().unwrap().current(), expected);
+    }
     let video = Video::default();
     video.0.lock().unwrap().rate = stream.rate.clone();
     video.build_server_with_handle().unwrap();

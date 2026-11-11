@@ -6,7 +6,7 @@ use ironrdp_server::{
 use kde_rdp_bridge::{
     MicrophoneMode,
     broker::Broker,
-    listen_addr,
+    listen_addr, memory,
     microphone::Microphone,
     performance::{ConnectionStats, connection as connection_stats},
     server_error,
@@ -155,11 +155,16 @@ impl ConnectionHandler for Lifecycle {
             b.discard();
             b.begin_connection(None);
         }
+        // The connection's encoder and capture are being torn down; return
+        // their freed heap once that settled, off this runtime thread.
+        memory::client_disconnected();
         PostConnectionAction::Continue
     }
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Before the NVENC preflight frees its first large buffers.
+    memory::configure_allocator();
     anyhow::ensure!(
         std::env::args_os().len() == 1,
         "configuration uses KDE_RDP_* environment variables; no password arguments"
@@ -183,6 +188,8 @@ async fn main() -> anyhow::Result<()> {
     // Empty selects KWin's first output (the virtual backend's Virtual-0).
     let output = std::env::var("KDE_RDP_OUTPUT").unwrap_or_default();
     let video = Video::from_env()?;
+    // Trims what the preflight's encoder left in the heap, and reports.
+    memory::start();
     let clipboard = kde_rdp_bridge::clipboard::Clipboard::default();
     let mut audio = kde_rdp_bridge::audio::Audio::default()
         .with_tuning(kde_rdp_bridge::audio::AudioTuning::from_env());

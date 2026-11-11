@@ -6,6 +6,7 @@ mod gpu_capture;
 pub(crate) mod keyboard;
 pub mod login;
 mod login_compose;
+pub mod memory;
 pub mod microphone;
 pub mod network;
 pub mod performance;

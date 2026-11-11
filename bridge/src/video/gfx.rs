@@ -206,6 +206,8 @@ impl Video {
             gpu_failed: false,
             last_gpu: None,
             refinement: None,
+            pending_refinement: false,
+            skipped: None,
             next_frame: Instant::now(),
             diagnostics: crate::performance::Telemetry::from_env(),
             credit_wait_started: None,

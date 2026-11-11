@@ -8,9 +8,10 @@ use std::{
 /// Keep interactive graphics within a short delivery budget. Feedback includes
 /// network transit and client decoding, so this is not an audio/video clock.
 ///
-/// The target moves between a few quantized levels. FFmpeg's NVENC rate
-/// reconfiguration emits an IDR, so every level change costs a key frame:
-/// decreases still react within a second, increases need sustained health.
+/// The target moves between a few quantized levels: sustained delay lowers it
+/// at most once a second, increases need sustained health. A single delayed
+/// flight is not congestion (see [`Self::delayed`]). What the encoder is
+/// actually configured with is decided by [`RateApplier`].
 pub(crate) struct AdaptiveBitrate {
     ceiling: u32,
     levels: Vec<u32>,
@@ -31,6 +32,18 @@ pub(crate) struct AdaptiveBitrate {
     joint: bool,
     diagnostics: Telemetry,
     last_audio_congestion: Option<Instant>,
+    /// Sound pressure cut the target and the encoder has not adopted a rate
+    /// at or below it yet. Unlike `last_audio_congestion` this does not age:
+    /// the cut reaches the encoder with the next changed frame, however much
+    /// later that frame comes.
+    audio_cut_pending: bool,
+    /// The boundary of the delay episode in progress: when it was noticed,
+    /// or the first acknowledgement after that if none was arriving then.
+    /// Frames sent before it share its cause; one sent afterwards is fresh
+    /// evidence.
+    suspect: Option<Instant>,
+    /// When the last delay episode ended with a healthy later frame.
+    recovered: Option<Instant>,
 }
 
 impl Default for AdaptiveBitrate {
@@ -50,6 +63,16 @@ impl AdaptiveBitrate {
     const INCREASE_HOLD: Duration = Duration::from_secs(10);
     const LEVELS: u32 = 6;
     const FLOOR: u32 = 1_000_000;
+    /// A frame outstanding this long past the delivery budget is congestion
+    /// by itself. The link stalls measured through mstsc over the internet
+    /// on 2026-11-11 delayed acknowledgements to 160-370 ms; 4 of 130
+    /// delayed 5 s intervals that day exceeded 500 ms.
+    const STALL_GRACE: Duration = Duration::from_millis(350);
+    /// A delay episode beginning this soon after the last one ended is not
+    /// isolated.
+    const ISOLATION: Duration = Duration::from_millis(500);
+    /// Unacknowledged frames a still-image refinement may add to.
+    const REFINEMENT_FLIGHT: usize = 2;
 
     pub(crate) fn new(ceiling: u32, now: Instant) -> Self {
         Self {
@@ -72,6 +95,9 @@ impl AdaptiveBitrate {
             joint: false,
             diagnostics: Telemetry::from_env(),
             last_audio_congestion: None,
+            audio_cut_pending: false,
+            suspect: None,
+            recovered: None,
         }
     }
     /// Geometric steps from the ceiling to the 1 Mbps floor, rounded to
@@ -125,13 +151,43 @@ impl AdaptiveBitrate {
     pub(crate) fn max_frames_in_flight(&self) -> u32 {
         self.window
     }
+    /// Whether sound reported transport pressure within the recovery interval.
+    pub(crate) fn audio_pressure(&self, now: Instant) -> bool {
+        self.last_audio_congestion
+            .is_some_and(|at| now.saturating_duration_since(at) < Self::RECOVER_INTERVAL)
+    }
+    /// Whether a decrease must reach the encoder with the next changed frame
+    /// instead of waiting for the payload to exceed it: sound reported
+    /// pressure recently, or a target it cut has not been adopted yet.
+    pub(crate) fn audio_urgent(&self, now: Instant) -> bool {
+        self.audio_cut_pending || self.audio_pressure(now)
+    }
+    /// The encoder is about to encode at `bitrate`. At or below the target,
+    /// a cut made by sound pressure has arrived; a refinement frame held at
+    /// a higher applied rate leaves it pending.
+    pub(crate) fn rate_adopted(&mut self, bitrate: u32) {
+        if bitrate <= self.current() {
+            self.audio_cut_pending = false;
+        }
+    }
+    /// Tracked frames sent but not yet acknowledged.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.sent.len()
+    }
+    /// Whether a still image may be sharpened now: a quiet, healthy path,
+    /// fewer than [`Self::REFINEMENT_FLIGHT`] frames unacknowledged, and
+    /// always one credit left for a frame the desktop actually changed.
+    /// Refinement is paced by the current target instead of being limited to
+    /// high levels. During a delay episode it waits for the delayed flight;
+    /// once nothing is in flight, one refinement frame is the later frame
+    /// that resolves the episode, which a still screen would otherwise never
+    /// send.
     pub(crate) fn permits_refinement(&self, now: Instant) -> bool {
         self.last_queue == 0
-            && self.sent.is_empty()
-            && self.current() >= self.ceiling / 2
-            && self
-                .last_audio_congestion
-                .is_none_or(|at| now.saturating_duration_since(at) >= Self::RECOVER_INTERVAL)
+            && self.sent.len() < Self::REFINEMENT_FLIGHT
+            && self.sent.len() + 1 < self.window as usize
+            && (self.suspect.is_none() || self.sent.is_empty())
+            && !self.audio_pressure(now)
             && (self.suspended
                 || self
                     .last_ack
@@ -148,12 +204,15 @@ impl AdaptiveBitrate {
         self.window = 2;
         self.last_window_reduction = None;
         self.last_send = None;
+        self.suspect = None;
+        self.recovered = None;
     }
     pub(crate) fn audio_congested(&mut self, now: Instant) {
         self.last_audio_congestion = Some(
             self.last_audio_congestion
                 .map_or(now, |previous| previous.max(now)),
         );
+        self.audio_cut_pending = true;
         // Sound can be queued even when graphics ACKs are healthy or suspended.
         // Use the same reduction cooldown, but keep recovery tied to both streams.
         self.congested(now);
@@ -169,6 +228,7 @@ impl AdaptiveBitrate {
             // Sound negotiation can precede creation of the graphics context.
             // Preserve its pressure and target without carrying old frame IDs.
             self.last_audio_congestion = Some(at);
+            self.audio_cut_pending = previous.audio_cut_pending;
             self.level = self.level.max(self.level_at_most(previous.current()));
             self.last_change = previous.last_change.min(now);
         }
@@ -185,6 +245,15 @@ impl AdaptiveBitrate {
         if let Some(previous) = self.last_send {
             self.diagnostics
                 .sample("send_cadence", now.saturating_duration_since(previous));
+            // An episode ends with a healthy later frame. When the desktop
+            // went still instead, nothing resolved it; after an idle stream
+            // it says nothing about the path this frame meets, so that
+            // frame's delay would be a first one again.
+            if self.sent.is_empty()
+                && now.saturating_duration_since(previous) >= Self::RECOVER_INTERVAL
+            {
+                self.suspect = None;
+            }
         }
         self.last_send = Some(now);
         self.diagnostics.count("sent_frames", 1);
@@ -218,13 +287,46 @@ impl AdaptiveBitrate {
             self.diagnostics.count("bitrate_level_decreases", 1);
         }
     }
+    /// Delivery exceeded the budget for frames sent between `oldest` and
+    /// `newest`. One late flight is tolerated: a link stall holds every frame
+    /// in flight and releases them together, and no lower rate prevents it.
+    /// It is congestion when a frame sent after the episode's boundary is
+    /// late as well, when episodes follow each other closely, or when a frame
+    /// has been outstanding far too long. While no acknowledgement has
+    /// arrived since the episode was noticed, the stall may still be in
+    /// progress and a frame sent meanwhile shares it: only the stall grace
+    /// applies until the first acknowledgement sets the boundary.
+    fn delayed(&mut self, oldest: Instant, newest: Instant, now: Instant) {
+        let sustained = match self.suspect {
+            Some(since) => newest >= since && self.last_ack.is_some_and(|at| at >= since),
+            None => self
+                .recovered
+                .is_some_and(|at| now.saturating_duration_since(at) < Self::ISOLATION),
+        };
+        let stalled =
+            now.saturating_duration_since(oldest) > self.delivery_budget() + Self::STALL_GRACE;
+        if self.suspect.is_none() {
+            self.suspect = Some(now);
+            if !sustained && !stalled {
+                self.diagnostics.count("tolerated_delay_episodes", 1);
+            }
+        }
+        if sustained || stalled {
+            self.congested(now);
+        }
+    }
     pub(crate) fn check_stall(&mut self, now: Instant) {
-        if self
+        let budget = self.delivery_budget();
+        let mut overdue = self
             .sent
             .values()
-            .any(|at| now.duration_since(*at) > self.delivery_budget())
-        {
-            self.congested(now);
+            .copied()
+            .filter(|at| now.saturating_duration_since(*at) > budget);
+        if let Some(first) = overdue.next() {
+            let (oldest, newest) = overdue.fold((first, first), |(oldest, newest), at| {
+                (oldest.min(at), newest.max(at))
+            });
+            self.delayed(oldest, newest, now);
         }
     }
     pub(crate) fn acknowledged(&mut self, id: u32, queue_depth: u32, now: Instant) {
@@ -232,6 +334,7 @@ impl AdaptiveBitrate {
         if queue_depth == u32::MAX {
             self.sent.clear();
             self.suspended = true;
+            self.suspect = None;
             self.healthy_since = None;
             self.baseline_candidate = None;
             self.last_queue = 0;
@@ -250,6 +353,14 @@ impl AdaptiveBitrate {
         self.diagnostics
             .count("outstanding_frames", self.sent.len() as u64);
         self.diagnostics.report("graphics_feedback", now);
+        // An episode noticed while nothing was arriving began no later than
+        // this, the first acknowledgement since: frames sent during the
+        // silence met the same stall.
+        if let Some(since) = self.suspect
+            && self.last_ack.is_none_or(|at| at < since)
+        {
+            self.suspect = Some(now);
+        }
         self.last_ack = Some(now);
         self.last_queue = queue_depth;
         // A lifetime minimum mistakes a lasting transit change for congestion.
@@ -294,8 +405,19 @@ impl AdaptiveBitrate {
         // at most 150ms of payload at the current target rate.
         let queue_budget = u64::from(self.current()) * Self::BUDGET.as_millis() as u64 / 8_000;
         if u64::from(queue_depth) > queue_budget || elapsed > budget {
-            self.congested(now);
+            self.delayed(sent, sent, now);
             return;
+        }
+        match self.suspect {
+            // The path delivers again: the episode is over.
+            Some(since) if sent >= since => {
+                self.suspect = None;
+                self.recovered = Some(now);
+            }
+            // A frame of the delayed flight arrived in time; growth waits
+            // until a later frame resolves the episode.
+            Some(_) => return,
+            None => (),
         }
         let healthy = *self.healthy_since.get_or_insert(now);
         // Allow enough credits for the measured round trip at the target
@@ -331,35 +453,80 @@ impl AdaptiveBitrate {
         }
     }
 }
-/// Applies controller targets to the live encoder. Each NVENC rate change
-/// costs an IDR: decreases apply at once, while an increase waits for an IDR
-/// that is due anyway (refresh, resume, dropped frame, resize, cadence change)
-/// or until `defer` has passed since the last IDR, when it replaces one.
+/// Applies controller targets to the live encoder. FFmpeg's NVENC wrapper
+/// resets rate control and forces an IDR on every rate change, which on a
+/// settled page costs a visibly soft picture for a quarter of a second. A
+/// target is therefore adopted for free whenever an IDR is due anyway
+/// (refresh, resume, dropped frame, resize, cadence change); otherwise only
+/// when it would change what the encoder sends: a decrease once the last
+/// second of payload exceeded the lower target (or at once after sound
+/// pressure, as every decrease used to),
+/// an increase once `defer` has passed since the last IDR and the applied
+/// rate is what limits the encoder. The credit window, not the encoder
+/// rate, is the immediate congestion response.
 pub(crate) struct RateApplier {
     applied: Option<(u32, u32)>,
     last_idr: Option<Instant>,
     defer: Duration,
+    /// Submitted frames within the last [`Self::WINDOW`]: time and bytes.
+    payload: VecDeque<(Instant, u64)>,
+    payload_bytes: u64,
 }
 impl RateApplier {
+    /// Span over which the submitted payload is compared with a target.
+    const WINDOW: Duration = Duration::from_secs(1);
     pub(crate) fn new(defer: Duration) -> Self {
         Self {
             applied: None,
             last_idr: None,
             defer,
+            payload: VecDeque::new(),
+            payload_bytes: 0,
         }
     }
-    /// The bitrate to configure for the next encoded frame at `fps`.
-    pub(crate) fn select(&mut self, target: u32, fps: u32, idr_due: bool, now: Instant) -> u32 {
+    /// Record one submitted frame's H.264 payload.
+    pub(crate) fn submitted(&mut self, bytes: usize, now: Instant) {
+        self.payload_rate(now);
+        self.payload.push_back((now, bytes as u64));
+        self.payload_bytes += bytes as u64;
+    }
+    /// Bits submitted during the last second.
+    fn payload_rate(&mut self, now: Instant) -> u64 {
+        while self
+            .payload
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= Self::WINDOW)
+        {
+            self.payload_bytes -= self.payload.pop_front().unwrap().1;
+        }
+        self.payload_bytes * 8
+    }
+    /// The bitrate to configure for the next encoded frame at `fps`. `urgent`
+    /// is sound pressure, recent or not yet adopted
+    /// ([`AdaptiveBitrate::audio_urgent`]); `hold` keeps the applied rate (a
+    /// refinement frame of a still image must never turn into an IDR).
+    pub(crate) fn select(
+        &mut self,
+        target: u32,
+        fps: u32,
+        idr_due: bool,
+        urgent: bool,
+        hold: bool,
+        now: Instant,
+    ) -> u32 {
         let bitrate = match self.applied {
-            Some((applied, applied_fps))
-                if target > applied
-                    && applied_fps == fps
-                    && !idr_due
-                    && self
-                        .last_idr
-                        .is_some_and(|at| now.saturating_duration_since(at) < self.defer) =>
-            {
-                applied
+            Some((applied, applied_fps)) if applied_fps == fps && !idr_due && applied != target => {
+                let rate = self.payload_rate(now);
+                let reconfigure = if hold {
+                    false
+                } else if target < applied {
+                    urgent || rate > u64::from(target)
+                } else {
+                    self.last_idr
+                        .is_none_or(|at| now.saturating_duration_since(at) >= self.defer)
+                        && rate * 4 >= u64::from(applied) * 3
+                };
+                if reconfigure { target } else { applied }
             }
             _ => target,
         };
@@ -368,6 +535,124 @@ impl RateApplier {
     }
     pub(crate) fn idr_sent(&mut self, now: Instant) {
         self.last_idr = Some(now);
+    }
+    /// The cadence the encoder was last configured with. A refinement frame
+    /// is encoded at it whatever the controller now asks for, because a
+    /// cadence change recreates the encoder and starts with an IDR.
+    pub(crate) fn applied_fps(&self) -> Option<u32> {
+        self.applied.map(|(_, fps)| fps)
+    }
+}
+
+/// Sharpening of a still screen. The encoder lowers its quantiser about one
+/// step per frame, so a page that stops changing is left as soft as its last
+/// frame. While no new capture arrives the retained image is encoded again
+/// until the encoder has nothing left to add: the quantiser has reached its
+/// floor and the frames stopped shrinking.
+pub(crate) struct Refinement {
+    pub(crate) due: Instant,
+    expires: Instant,
+    frames: u32,
+    /// Size of the previous frame of this image if it was encoded at the floor.
+    floor_bytes: Option<usize>,
+    /// Lowest quantiser of this image so far, its previous frame's size, its
+    /// smallest refinement frame, and the run of frames that improved nothing.
+    lowest_qp: Option<u8>,
+    previous_bytes: usize,
+    smallest: usize,
+    stagnant: u32,
+}
+impl Refinement {
+    /// Quiet time after the last change before sharpening starts; shorter
+    /// than this and 15-30 fps content would be refined between its frames.
+    const SETTLE: Duration = Duration::from_millis(100);
+    const EXPIRY: Duration = Duration::from_secs(6);
+    /// Retry interval while the controller does not permit refinement.
+    pub(crate) const RETRY: Duration = Duration::from_millis(250);
+    /// Convergence took 15-30 frames at 12 Mbit/s and about 80 at 1 Mbit/s.
+    const MAX_FRAMES: u32 = 120;
+    /// Consecutive frames without a lower quantiser, no smaller than their
+    /// predecessor and about as small as the smallest so far, after which the
+    /// encoder evidently adds nothing. The average quantiser does not always
+    /// reach the floor: with spatial AQ the floor clamps single macroblocks
+    /// and the average settled two steps above it, and at low rates rate
+    /// control held it near 40 on a still page (NVENC, 2026-11-11). Rate
+    /// control pauses in mid-convergence at 1 Mbit/s lasted three or four
+    /// such frames.
+    const STAGNANT: u32 = 16;
+    /// Arm after a changed frame of `bytes` at quantiser `qp` was sent.
+    pub(crate) fn armed(qp: Option<u8>, bytes: usize, floor: u8, now: Instant) -> Self {
+        Self {
+            due: now + Self::SETTLE,
+            expires: now + Self::EXPIRY,
+            frames: 0,
+            floor_bytes: qp.filter(|qp| *qp <= floor).map(|_| bytes),
+            lowest_qp: qp,
+            previous_bytes: bytes,
+            smallest: usize::MAX,
+            stagnant: 0,
+        }
+    }
+    /// Only a clock: a capture skipped for want of a credit is waiting, and
+    /// nothing else would wake the stream before the next capture.
+    pub(crate) fn waiting(delay: Duration, now: Instant) -> Self {
+        Self {
+            due: now + delay,
+            expires: now + Self::EXPIRY,
+            frames: 0,
+            floor_bytes: None,
+            lowest_qp: None,
+            previous_bytes: 0,
+            smallest: usize::MAX,
+            stagnant: 0,
+        }
+    }
+    pub(crate) fn expired(&self, now: Instant) -> bool {
+        now >= self.expires
+    }
+    /// Look again after `delay`; a timer that fired must always move on.
+    pub(crate) fn postpone(&mut self, delay: Duration, now: Instant) {
+        self.due = now + delay;
+    }
+    /// Look again no later than `delay` from now.
+    pub(crate) fn hasten(&mut self, delay: Duration, now: Instant) {
+        self.due = self.due.min(now + delay);
+    }
+    /// A refinement frame was sent. Returns whether the image still needs
+    /// another, scheduled no faster than the cadence or the target bitrate.
+    pub(crate) fn refined(
+        &mut self,
+        qp: Option<u8>,
+        bytes: usize,
+        floor: u8,
+        target: u32,
+        fps: u32,
+        now: Instant,
+    ) -> bool {
+        self.frames += 1;
+        // Without encoder statistics, keep the former single refinement.
+        let Some(qp) = qp else { return false };
+        let at_floor = qp <= floor;
+        let converged = at_floor
+            && self
+                .floor_bytes
+                .is_some_and(|previous| bytes * 10 >= previous * 9);
+        self.floor_bytes = at_floor.then_some(bytes);
+        let lower = self.lowest_qp.is_none_or(|lowest| qp < lowest);
+        if lower {
+            self.lowest_qp = Some(qp);
+        }
+        self.smallest = self.smallest.min(bytes);
+        let flat =
+            bytes * 10 >= self.previous_bytes * 9 && bytes <= self.smallest.saturating_mul(2);
+        self.previous_bytes = bytes;
+        self.stagnant = if !lower && flat { self.stagnant + 1 } else { 0 };
+        let settled = converged || self.stagnant >= Self::STAGNANT;
+        let spacing = Duration::from_secs_f64(1.0 / f64::from(fps)).max(Duration::from_micros(
+            bytes as u64 * 8_000_000 / u64::from(target.max(1)),
+        ));
+        self.due = now + spacing;
+        !settled && self.frames < Self::MAX_FRAMES && self.due < self.expires
     }
 }
 
@@ -476,15 +761,28 @@ fn gpu_capture_setting(value: Option<&str>, nvenc: bool) -> anyhow::Result<bool>
         _ => anyhow::bail!("KDE_RDP_GPU_CAPTURE must be auto or shm"),
     }
 }
-/// Seconds between periodic IDRs. Every recovery point already forces one,
-/// so this is only a safety net over reliable RDPGFX transport.
-pub(crate) const DEFAULT_GOP_SECONDS: u32 = 30;
+/// Seconds of encoded frames between periodic IDRs. Every recovery point
+/// already forces one over reliable RDPGFX transport, and a periodic IDR on a
+/// settled page costs a visibly soft picture, so the default is the maximum.
+pub(crate) const DEFAULT_GOP_SECONDS: u32 = 3600;
 pub(crate) fn gop_seconds() -> anyhow::Result<u32> {
     setting(
         "KDE_RDP_GOP_SECONDS",
         environment("KDE_RDP_GOP_SECONDS")?.as_deref(),
         DEFAULT_GOP_SECONDS,
         3600,
+    )
+}
+/// Lowest quantiser the encoder may use. Below it NVENC spends most of its
+/// bitrate on differences nobody can see; settled 1080p text measured a worst
+/// 64x64 tile of 44-45 dB at 18 (16: 45, 20: 41-42, unfloored: 48).
+pub(crate) const DEFAULT_MIN_QP: u32 = 18;
+pub(crate) fn min_qp() -> anyhow::Result<u32> {
+    setting(
+        "KDE_RDP_MIN_QP",
+        environment("KDE_RDP_MIN_QP")?.as_deref(),
+        DEFAULT_MIN_QP,
+        51,
     )
 }
 pub(crate) fn joint_adaptation_requested() -> anyhow::Result<bool> {
@@ -509,6 +807,7 @@ pub(crate) struct VideoConfig {
     pub(crate) gpu_capture: bool,
     pub(crate) joint_adaptation: bool,
     pub(crate) gop_seconds: u32,
+    pub(crate) min_qp: u32,
 }
 impl Default for VideoConfig {
     /// The NVENC defaults with no environment overrides.
@@ -522,6 +821,7 @@ impl Default for VideoConfig {
             gpu_capture: true,
             joint_adaptation: false,
             gop_seconds: DEFAULT_GOP_SECONDS,
+            min_qp: DEFAULT_MIN_QP,
         }
     }
 }
@@ -537,6 +837,7 @@ impl VideoConfig {
             gpu_capture: gpu_capture_requested()?,
             joint_adaptation: joint_adaptation_requested()?,
             gop_seconds: gop_seconds()?,
+            min_qp: min_qp()?,
         })
     }
     /// How long a pending bitrate increase may wait for an IDR due anyway.
@@ -1076,19 +1377,26 @@ mod tests {
         assert!(telemetry.counters.is_empty(), "diagnostics stay off");
     }
     #[test]
-    fn bitrate_reduces_on_delay_or_decoder_backlog_and_recovers_slowly() {
+    fn bitrate_reduces_on_repeated_delay_or_decoder_backlog_and_recovers_slowly() {
         let start = Instant::now();
         let mut rate = AdaptiveBitrate::new(12_000_000, start);
         rate.sent(0, start);
         rate.acknowledged(0, 0, start + Duration::from_millis(30));
         rate.sent(1, start + Duration::from_millis(1000));
         rate.acknowledged(1, 0, start + Duration::from_millis(1200));
-        assert_eq!(rate.current(), 7_300_000, "delay drops one level");
+        assert_eq!(rate.current(), 12_000_000, "one late frame is tolerated");
         rate.sent(2, start + Duration::from_millis(1210));
         rate.acknowledged(2, 1_000_000, start + Duration::from_millis(1240));
+        assert_eq!(
+            rate.current(),
+            7_300_000,
+            "a later frame's backlog confirms it"
+        );
+        rate.sent(3, start + Duration::from_millis(1250));
+        rate.acknowledged(3, 1_000_000, start + Duration::from_millis(1280));
         assert_eq!(rate.current(), 7_300_000, "reductions have a cooldown");
-        rate.sent(3, start + Duration::from_millis(2300));
-        rate.acknowledged(3, 1_000_000, start + Duration::from_millis(2330));
+        rate.sent(4, start + Duration::from_millis(2300));
+        rate.acknowledged(4, 1_000_000, start + Duration::from_millis(2330));
         assert_eq!(rate.current(), 4_400_000, "backlog drops one level");
         let healthy = |ids: std::ops::RangeInclusive<u32>, rate: &mut AdaptiveBitrate| {
             for id in ids {
@@ -1136,52 +1444,237 @@ mod tests {
     }
 
     #[test]
-    fn rate_increases_wait_for_an_idr_due_anyway_but_decreases_apply_at_once() {
+    fn the_encoder_is_reconfigured_only_when_the_new_rate_changes_its_output() {
         let start = Instant::now();
         let at = |ms| start + Duration::from_millis(ms);
         let mut applier = RateApplier::new(Duration::from_secs(30));
-        assert_eq!(applier.select(12_000_000, 60, true, at(0)), 12_000_000);
+        let select = |applier: &mut RateApplier, target, idr, ms| {
+            applier.select(target, 60, idr, false, false, at(ms))
+        };
+        assert_eq!(select(&mut applier, 12_000_000, true, 0), 12_000_000);
         applier.idr_sent(at(0));
-        assert_eq!(applier.select(7_300_000, 60, false, at(1000)), 7_300_000);
-        applier.idr_sent(at(1000));
-        for ms in [11_000, 20_000, 30_999] {
-            assert_eq!(
-                applier.select(12_000_000, 60, false, at(ms)),
-                7_300_000,
-                "no extra IDR for an increase within the hold time"
-            );
+        // 60 frames of 10 kB within a second: 4.8 Mbit/s.
+        for frame in 0..60 {
+            applier.submitted(10_000, at(1_000 + frame * 16));
         }
         assert_eq!(
-            applier.select(4_400_000, 60, false, at(31_000)),
-            4_400_000,
-            "a pending increase never delays a decrease"
-        );
-        applier.idr_sent(at(31_000));
-        assert_eq!(applier.select(12_000_000, 60, true, at(32_000)), 12_000_000);
-        applier.idr_sent(at(32_000));
-        assert_eq!(applier.select(7_300_000, 60, false, at(33_000)), 7_300_000);
-        applier.idr_sent(at(33_000));
-        assert_eq!(
-            applier.select(12_000_000, 30, false, at(34_000)),
+            select(&mut applier, 7_300_000, false, 2_000),
             12_000_000,
+            "4.8 Mbit/s fits the lower target: no IDR for it"
+        );
+        assert_eq!(
+            select(&mut applier, 4_400_000, false, 2_000),
+            4_400_000,
+            "the payload exceeds this target"
+        );
+        applier.idr_sent(at(2_000));
+        // The payload window forgets after a second.
+        assert_eq!(select(&mut applier, 2_700_000, false, 3_100), 4_400_000);
+        assert_eq!(
+            select(&mut applier, 2_700_000, true, 3_200),
+            2_700_000,
+            "an IDR due anyway adopts the target for free"
+        );
+        applier.idr_sent(at(3_200));
+        // Increases: wait out the hold, and for a rate that limits the encoder.
+        for ms in [4_000, 20_000, 33_199, 33_200, 60_000] {
+            assert_eq!(
+                select(&mut applier, 12_000_000, false, ms),
+                2_700_000,
+                "{ms}"
+            );
+        }
+        for frame in 0..60 {
+            applier.submitted(4_500, at(60_000 + frame * 16));
+        }
+        assert_eq!(
+            select(&mut applier, 12_000_000, false, 60_990),
+            12_000_000,
+            "2.16 of 2.7 Mbit/s: the applied rate is the limit"
+        );
+        applier.idr_sent(at(60_990));
+        assert_eq!(select(&mut applier, 7_300_000, false, 61_500), 12_000_000);
+        assert_eq!(
+            applier.select(7_300_000, 30, false, false, false, at(61_600)),
+            7_300_000,
             "a cadence change recreates the encoder anyway"
         );
-        applier.idr_sent(at(34_000));
-        assert_eq!(applier.select(7_300_000, 30, false, at(35_000)), 7_300_000);
-        applier.idr_sent(at(35_000));
-        assert_eq!(applier.select(12_000_000, 30, false, at(64_999)), 7_300_000);
+    }
+
+    #[test]
+    fn sound_pressure_lowers_the_encoder_rate_at_once_and_refinement_never_reconfigures() {
+        let start = Instant::now();
+        let mut applier = RateApplier::new(Duration::from_secs(30));
         assert_eq!(
-            applier.select(12_000_000, 30, false, at(65_000)),
-            12_000_000,
-            "the increase replaces the next periodic IDR"
+            applier.select(12_000_000, 60, true, false, false, start),
+            12_000_000
         );
+        applier.idr_sent(start);
+        let later = start + Duration::from_secs(40);
+        for frame in 0..60 {
+            applier.submitted(20_000, later - Duration::from_millis(frame * 16));
+        }
+        assert_eq!(
+            applier.select(7_300_000, 60, false, false, true, later),
+            12_000_000,
+            "a refinement frame keeps the applied rate even above the target"
+        );
+        let quiet = later + Duration::from_secs(2);
+        assert_eq!(
+            applier.select(7_300_000, 60, false, false, false, quiet),
+            12_000_000
+        );
+        assert_eq!(
+            applier.select(7_300_000, 60, false, true, false, quiet),
+            7_300_000,
+            "sound pressure applies the decrease with no payload at all"
+        );
+    }
+
+    /// Encoder output measured on NVENC (p1, ull, VBR, one-frame VBV, floor 18)
+    /// after a 1080p page switch: (average QP, bytes) per frame.
+    const SWITCH_12M: [(u8, usize); 22] = [
+        (42, 39_660),
+        (34, 23_427),
+        (32, 6_739),
+        (30, 4_920),
+        (29, 7_815),
+        (28, 4_089),
+        (27, 4_504),
+        (26, 4_786),
+        (25, 4_493),
+        (24, 3_969),
+        (22, 7_020),
+        (21, 9_021),
+        (20, 4_189),
+        (19, 6_670),
+        (18, 6_662),
+        (18, 1_853),
+        (18, 1_095),
+        (18, 191),
+        (18, 101),
+        (18, 81),
+        (18, 81),
+        (18, 81),
+    ];
+    /// The same at 1 Mbit/s: rate control pauses with tiny frames far above
+    /// the floor, which are not convergence.
+    const SWITCH_1M_TAIL: [(u8, usize); 14] = [
+        (38, 705),
+        (38, 105),
+        (38, 79),
+        (38, 79),
+        (37, 3_640),
+        (36, 3_452),
+        (34, 4_230),
+        (36, 121),
+        (37, 84),
+        (37, 79),
+        (36, 79),
+        (34, 3_910),
+        (33, 4_136),
+        (31, 4_229),
+    ];
+
+    #[test]
+    fn a_still_image_is_refined_until_the_encoder_has_nothing_left_to_add() {
+        let start = Instant::now();
+        let (qp, bytes) = SWITCH_12M[0];
+        let mut refinement = Refinement::armed(Some(qp), bytes, 18, start);
+        assert_eq!(refinement.due, start + Duration::from_millis(100));
+        let mut now = refinement.due;
+        let mut frames = 0;
+        for (qp, bytes) in SWITCH_12M[1..].iter().copied() {
+            frames += 1;
+            if !refinement.refined(Some(qp), bytes, 18, 12_000_000, 60, now) {
+                break;
+            }
+            assert!(refinement.due >= now + Duration::from_micros(16_666));
+            now = refinement.due;
+        }
+        assert_eq!(frames, 20, "stops at the second 81-byte frame at the floor");
+        // Tiny frames above the floor are rate-control pauses.
+        let mut refinement = Refinement::armed(Some(44), 35_267, 18, start);
+        for (qp, bytes) in SWITCH_1M_TAIL {
+            assert!(refinement.refined(Some(qp), bytes, 18, 1_000_000, 60, start));
+        }
+        // Paced by the target: a 4 kB frame at 1 Mbit/s buys 32 ms.
+        assert!(refinement.refined(Some(30), 4_000, 18, 1_000_000, 60, start));
+        assert_eq!(refinement.due, start + Duration::from_millis(32));
+        // A small change on a settled page needs two tiny frames to prove it.
+        let mut refinement = Refinement::armed(Some(18), 217, 18, start);
+        assert!(refinement.refined(Some(18), 104, 18, 12_000_000, 60, start));
+        assert!(!refinement.refined(Some(18), 104, 18, 12_000_000, 60, start));
+        // Without encoder statistics: one refinement frame, as before.
+        let mut refinement = Refinement::armed(None, 40_000, 18, start);
+        assert!(!refinement.refined(None, 20_000, 18, 12_000_000, 60, start));
+        // Above the floor it ends once the encoder stopped improving. With
+        // spatial AQ the average quantiser settled at 20 over a floor of 18,
+        // with frames of about 100 bytes.
+        let mut refinement = Refinement::armed(Some(31), 14_000, 18, start);
+        let mut frames = 0;
+        for (qp, bytes) in [(26, 3_900), (22, 1_400), (20, 310)]
+            .into_iter()
+            .chain(std::iter::repeat((20, 101)))
+        {
+            frames += 1;
+            if !refinement.refined(Some(qp), bytes, 18, 12_000_000, 60, start) {
+                break;
+            }
+        }
+        assert_eq!(frames, 3 + 1 + 16, "sixteen frames that added nothing");
+        // At 2 Mbit/s rate control held a still page near QP 40, wavering.
+        let mut refinement = Refinement::armed(Some(44), 30_000, 18, start);
+        let mut frames = 0;
+        for qp in [41, 39, 40, 41, 39].into_iter().cycle() {
+            frames += 1;
+            if !refinement.refined(Some(qp), 80, 18, 2_000_000, 60, start) {
+                break;
+            }
+        }
+        assert_eq!(frames, 2 + 16, "two new lows, then sixteen without one");
+        // Without a floor (1) a still frame kept costing 9 kB at QP 3: the
+        // same rule stops paying for it.
+        let mut refinement = Refinement::armed(Some(30), 9_000, 1, start);
+        let mut frames = 0;
+        while refinement.refined(Some(3), 9_000, 1, 12_000_000, 60, start) {
+            frames += 1;
+        }
+        assert_eq!(frames, 16);
+        // Bounded by frame count and by the expiry when nothing settles:
+        // alternating sizes never count as stagnant.
+        let mut refinement = Refinement::armed(Some(30), 9_000, 1, start);
+        let mut frames = 1;
+        while refinement.refined(
+            Some(3),
+            [9_000, 4_000][frames % 2],
+            1,
+            12_000_000,
+            60,
+            start,
+        ) {
+            frames += 1;
+        }
+        assert_eq!(frames, 120);
+        let mut refinement = Refinement::armed(Some(30), 9_000, 18, start);
+        assert!(!refinement.expired(start + Duration::from_millis(5_999)));
+        assert!(refinement.expired(start + Duration::from_secs(6)));
+        assert!(!refinement.refined(
+            Some(30),
+            9_000,
+            18,
+            12_000_000,
+            60,
+            start + Duration::from_millis(5_990)
+        ));
     }
 
     #[test]
     fn video_config_defaults_gop_and_gpu_capture() {
         let config = VideoConfig::default();
-        assert_eq!(config.gop_seconds, 30);
+        assert_eq!(config.gop_seconds, 3600, "no periodic IDR within an hour");
         assert_eq!(config.rate_increase_defer(), Duration::from_secs(30));
+        assert_eq!(config.min_qp, 18);
         assert!(config.gpu_capture);
         let short = VideoConfig {
             gop_seconds: 5,
@@ -1206,6 +1699,12 @@ mod tests {
         for value in ["0", "3601", "-1", "infinite"] {
             assert!(setting("KDE_RDP_GOP_SECONDS", Some(value), 30, 3600).is_err());
         }
+        for value in ["1", "18", "51"] {
+            assert!(setting("KDE_RDP_MIN_QP", Some(value), DEFAULT_MIN_QP, 51).is_ok());
+        }
+        for value in ["0", "52", "-1", "off"] {
+            assert!(setting("KDE_RDP_MIN_QP", Some(value), DEFAULT_MIN_QP, 51).is_err());
+        }
     }
 
     #[test]
@@ -1221,6 +1720,9 @@ mod tests {
         assert_eq!(rate.current(), 12_000_000);
         rate.sent(30, start + Duration::from_secs(15));
         rate.acknowledged(30, 0, start + Duration::from_millis(15400));
+        assert_eq!(rate.current(), 12_000_000, "one late frame is tolerated");
+        rate.sent(31, start + Duration::from_millis(15500));
+        rate.acknowledged(31, 0, start + Duration::from_millis(15900));
         assert_eq!(
             rate.current(),
             7_300_000,
@@ -1250,6 +1752,8 @@ mod tests {
         assert_eq!(rate.baseline, Some(Duration::from_millis(20)));
         rate.sent(152, start + Duration::from_secs(77));
         rate.acknowledged(152, 0, start + Duration::from_millis(77250));
+        rate.sent(153, start + Duration::from_secs(78));
+        rate.acknowledged(153, 0, start + Duration::from_millis(78250));
         assert!(
             rate.current() < rate.ceiling(),
             "renewed excess delay must remain visible"
@@ -1556,6 +2060,439 @@ mod tests {
         rate.sent(100, start + Duration::from_secs(7));
         assert_eq!(rate.sent.len(), 1, "resume enables tracking again");
     }
+    /// A source of one frame per `interval` ms (60 fps unless changed) over
+    /// a path with a fixed ACK delay, limited by the credit window. `stall` = (first_ms, period_ms, length_ms): nothing is
+    /// delivered or acknowledged during a stall; held frames are released
+    /// when it ends. `slow` = (since_ms, by_ms) delays every frame sent from
+    /// then on and reports a small decoder queue, so the delay is not a
+    /// plateau the baseline may relearn. Returns the frames acknowledged.
+    struct Path {
+        ack_ms: u64,
+        stall: Option<(u64, u64, u64)>,
+        slow: Option<(u64, u64)>,
+        flight: VecDeque<(u32, u64, u32)>,
+        id: u32,
+        next: u64,
+        interval: u64,
+    }
+    impl Path {
+        fn new(ack_ms: u64) -> Self {
+            Self {
+                ack_ms,
+                stall: None,
+                slow: None,
+                flight: VecDeque::new(),
+                id: 0,
+                next: 0,
+                interval: 17,
+            }
+        }
+        fn release(&self, at: u64) -> u64 {
+            match self.stall {
+                Some((first, period, length)) if at >= first && (at - first) % period < length => {
+                    at - (at - first) % period + length
+                }
+                _ => at,
+            }
+        }
+        fn run(&mut self, rate: &mut AdaptiveBitrate, start: Instant, from: u64, to: u64) -> u32 {
+            let mut delivered = 0;
+            for ms in from..to {
+                let now = start + Duration::from_millis(ms);
+                while self.flight.front().is_some_and(|&(_, ack, _)| ack <= ms) {
+                    let (id, _, queue) = self.flight.pop_front().unwrap();
+                    rate.acknowledged(id, queue, now);
+                    delivered += 1;
+                }
+                rate.check_stall(now);
+                if ms >= self.next && self.flight.len() < rate.max_frames_in_flight() as usize {
+                    rate.sent(self.id, now);
+                    let slow = self
+                        .slow
+                        .filter(|&(since, _)| ms >= since)
+                        .map_or(0, |(_, by)| by);
+                    // The frame reaches the client after any stall, and its
+                    // acknowledgement returns after any stall as well.
+                    let arrival = self.release(ms + self.ack_ms / 2 + slow);
+                    let ack = self.release(arrival + self.ack_ms - self.ack_ms / 2);
+                    let ack = self
+                        .flight
+                        .back()
+                        .map_or(ack, |&(_, last, _)| ack.max(last));
+                    self.flight
+                        .push_back((self.id, ack, if slow > 0 { 10_000 } else { 0 }));
+                    self.id += 1;
+                    self.next = ms + self.interval;
+                }
+            }
+            delivered
+        }
+    }
+
+    #[test]
+    fn isolated_link_stalls_do_not_latch_the_window_or_the_floor() {
+        // 2026-11-11, Windows mstsc over the internet: the client's link went
+        // silent for 165-230 ms at a time (every 60 s all day, every 1-3 s for
+        // minutes), then delivered everything at once. Each stall reset the
+        // health timers, which pinned the window at 2 and the level at the
+        // floor on an otherwise healthy 35 ms path.
+        let start = Instant::now();
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.set_frame_rate_ceiling(60);
+        let mut path = Path::new(35);
+        path.run(&mut rate, start, 0, 1_000);
+        // Real congestion first: every frame is 400 ms late for six seconds.
+        path.slow = Some((1_000, 400));
+        path.run(&mut rate, start, 1_000, 7_000);
+        assert_eq!(rate.current(), 1_000_000);
+        assert_eq!(rate.max_frames_in_flight(), 2);
+        // The path heals, but stalls for 180 ms every 2 s.
+        path.slow = None;
+        path.stall = Some((8_000, 2_000, 180));
+        path.run(&mut rate, start, 7_000, 12_000);
+        assert!(
+            rate.max_frames_in_flight() >= 4,
+            "the window regrows within 5 s despite the stalls: {}",
+            rate.max_frames_in_flight()
+        );
+        let mut level = rate.current();
+        for second in 12..70 {
+            path.run(&mut rate, start, second * 1_000, (second + 1) * 1_000);
+            assert!(rate.current() >= level, "no reduction at {second} s");
+            assert!(rate.max_frames_in_flight() >= 4, "window at {second} s");
+            level = rate.current();
+        }
+        assert_eq!(rate.current(), 12_000_000, "five levels regained in 50 s");
+        let delivered = path.run(&mut rate, start, 70_000, 80_000);
+        assert!(delivered >= 500, "only {delivered} frames in 10 s");
+    }
+
+    #[test]
+    fn one_stalled_flight_changes_nothing_on_a_healthy_stream() {
+        let start = Instant::now();
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.set_frame_rate_ceiling(60);
+        let mut path = Path::new(100);
+        path.run(&mut rate, start, 0, 5_000);
+        assert_eq!(rate.max_frames_in_flight(), 8);
+        // 366 ms was the longest ordinary stall of the day.
+        path.stall = Some((5_000, 60_000, 366));
+        let delivered = path.run(&mut rate, start, 5_000, 15_000);
+        assert_eq!(rate.max_frames_in_flight(), 8);
+        assert_eq!(rate.current(), 12_000_000);
+        assert!(delivered >= 550, "{delivered}");
+    }
+
+    #[test]
+    fn sustained_delay_is_congestion_as_soon_as_a_later_frame_is_late() {
+        for ack_ms in [35, 100] {
+            let start = Instant::now();
+            let mut rate = AdaptiveBitrate::new(12_000_000, start);
+            rate.set_frame_rate_ceiling(60);
+            let mut path = Path::new(ack_ms);
+            path.run(&mut rate, start, 0, 5_000);
+            let window = rate.max_frames_in_flight();
+            path.slow = Some((5_000, 400));
+            path.run(&mut rate, start, 5_000, 5_400);
+            assert_eq!(
+                rate.current(),
+                12_000_000,
+                "the first late flight is not enough"
+            );
+            path.run(&mut rate, start, 5_400, 5_750);
+            assert!(
+                rate.max_frames_in_flight() < window && rate.current() == 7_300_000,
+                "{ack_ms} ms: window {} target {}",
+                rate.max_frames_in_flight(),
+                rate.current()
+            );
+            path.run(&mut rate, start, 5_750, 11_000);
+            assert_eq!(rate.current(), 1_000_000, "one level per second after that");
+            assert_eq!(rate.max_frames_in_flight(), 2);
+        }
+    }
+
+    #[test]
+    fn a_frame_outstanding_far_past_the_budget_is_congestion_by_itself() {
+        let start = Instant::now();
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.sent(0, start);
+        rate.acknowledged(0, 0, start + Duration::from_millis(30));
+        let sent = start + Duration::from_secs(2);
+        rate.sent(1, sent);
+        rate.check_stall(sent + Duration::from_millis(151));
+        rate.check_stall(sent + Duration::from_millis(500));
+        assert_eq!(rate.current(), 12_000_000, "within the stall grace");
+        rate.check_stall(sent + Duration::from_millis(501));
+        assert_eq!(rate.current(), 7_300_000, "150 ms budget plus 350 ms");
+        // The same for a late acknowledgement with nothing sent since.
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.sent(0, start);
+        rate.acknowledged(0, 0, start + Duration::from_millis(30));
+        rate.sent(1, sent);
+        rate.acknowledged(1, 0, sent + Duration::from_millis(501));
+        assert_eq!(rate.current(), 7_300_000);
+    }
+
+    #[test]
+    fn delay_episodes_in_quick_succession_are_congestion() {
+        for (gap_ms, reduced) in [(499, true), (500, false)] {
+            let start = Instant::now();
+            let at = |ms| start + Duration::from_millis(ms);
+            let mut rate = AdaptiveBitrate::new(12_000_000, start);
+            rate.sent(0, at(0));
+            rate.acknowledged(0, 0, at(30));
+            rate.sent(1, at(2_000));
+            rate.acknowledged(1, 0, at(2_200));
+            rate.sent(2, at(2_210));
+            rate.acknowledged(2, 0, at(2_240));
+            assert_eq!(rate.current(), 12_000_000);
+            rate.sent(3, at(2_240 + gap_ms - 200));
+            rate.acknowledged(3, 0, at(2_240 + gap_ms));
+            assert_eq!(rate.current() < 12_000_000, reduced, "{gap_ms} ms");
+        }
+    }
+
+    #[test]
+    fn a_tolerated_episode_holds_growth_until_a_later_frame_is_healthy() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.set_frame_rate_ceiling(60);
+        rate.sent(0, at(0));
+        rate.acknowledged(0, 0, at(20));
+        assert_eq!(rate.max_frames_in_flight(), 3);
+        rate.sent(1, at(1_000));
+        rate.sent(2, at(1_100));
+        rate.check_stall(at(1_160));
+        // Both frames were in flight when the stall was noticed; the second
+        // then arrives within the budget.
+        rate.acknowledged(1, 0, at(1_200));
+        rate.acknowledged(2, 0, at(1_205));
+        assert_eq!(
+            rate.max_frames_in_flight(),
+            3,
+            "no growth from a late flight"
+        );
+        rate.sent(3, at(1_210));
+        rate.acknowledged(3, 0, at(1_310));
+        assert_eq!(
+            rate.max_frames_in_flight(),
+            8,
+            "the next healthy frame sizes it"
+        );
+        assert_eq!(rate.current(), 12_000_000);
+    }
+    #[test]
+    fn a_stall_before_the_screen_goes_still_is_resolved_by_a_refinement_frame() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.set_frame_rate_ceiling(60);
+        rate.sent(0, at(0));
+        rate.acknowledged(0, 0, at(35));
+        let window = rate.max_frames_in_flight();
+        // The last two frames before the desktop stops changing meet a stall.
+        rate.sent(1, at(1_000));
+        rate.sent(2, at(1_016));
+        rate.check_stall(at(1_160));
+        assert!(
+            !rate.permits_refinement(at(1_160)),
+            "not while the delayed flight is outstanding"
+        );
+        rate.acknowledged(1, 0, at(1_200));
+        assert!(!rate.permits_refinement(at(1_200)));
+        rate.acknowledged(2, 0, at(1_205));
+        // Nothing else will be sent on a still screen: the refinement frame
+        // is the later frame that shows whether the path recovered.
+        assert!(rate.permits_refinement(at(1_300)));
+        rate.sent(3, at(1_300));
+        assert!(
+            !rate.permits_refinement(at(1_310)),
+            "one probe at a time until the episode is resolved"
+        );
+        rate.acknowledged(3, 0, at(1_335));
+        assert!(rate.permits_refinement(at(1_340)));
+        rate.sent(4, at(1_340));
+        assert!(
+            rate.permits_refinement(at(1_350)),
+            "resolved: two in flight again"
+        );
+        rate.acknowledged(4, 0, at(1_375));
+        assert_eq!(rate.current(), 12_000_000);
+        assert!(rate.max_frames_in_flight() >= window);
+        // Had the probe been late as well, that is sustained delay.
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.set_frame_rate_ceiling(60);
+        rate.sent(0, at(0));
+        rate.acknowledged(0, 0, at(35));
+        rate.sent(1, at(1_000));
+        rate.acknowledged(1, 0, at(1_200));
+        assert_eq!(rate.current(), 12_000_000);
+        assert!(rate.permits_refinement(at(1_300)));
+        rate.sent(2, at(1_300));
+        rate.acknowledged(2, 0, at(1_500));
+        assert_eq!(rate.current(), 7_300_000);
+    }
+
+    #[test]
+    fn an_unresolved_delay_episode_does_not_outlive_an_idle_stream() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let stalled_then_next_frame_after = |idle_ms: u64| {
+            let mut rate = AdaptiveBitrate::new(12_000_000, start);
+            rate.set_frame_rate_ceiling(60);
+            rate.sent(0, at(0));
+            rate.acknowledged(0, 0, at(35));
+            // A late frame, then the desktop goes still with no refinement.
+            rate.sent(1, at(1_000));
+            rate.acknowledged(1, 0, at(1_200));
+            // The next frame is late too.
+            rate.sent(2, at(1_200 + idle_ms));
+            rate.acknowledged(2, 0, at(1_200 + idle_ms + 200));
+            rate.current()
+        };
+        assert_eq!(
+            stalled_then_next_frame_after(1_000),
+            7_300_000,
+            "a later frame late soon afterwards is sustained delay"
+        );
+        assert_eq!(
+            stalled_then_next_frame_after(60_000),
+            12_000_000,
+            "after an idle stream a late frame is a first one again"
+        );
+    }
+
+    #[test]
+    fn a_stall_while_frames_are_sparse_is_tolerated_at_any_frame_rate() {
+        // Typing at about 6 fps over a 35 ms path, with a 330 ms link stall:
+        // the stall is noticed while it lasts, and the next keystroke's frame
+        // is sent into the same silence. It is not a later, independently
+        // late frame; the first acknowledgement after the stall is where the
+        // episode's evidence starts.
+        for interval in [333, 167, 100, 67, 33, 17] {
+            let start = Instant::now();
+            let mut rate = AdaptiveBitrate::new(12_000_000, start);
+            rate.set_frame_rate_ceiling(60);
+            let mut path = Path::new(35);
+            path.interval = interval;
+            path.run(&mut rate, start, 0, 5_000);
+            let window = rate.max_frames_in_flight();
+            path.stall = Some((5_000, 60_000, 330));
+            path.run(&mut rate, start, 5_000, 9_000);
+            assert_eq!(rate.current(), 12_000_000, "{interval} ms between frames");
+            assert_eq!(rate.max_frames_in_flight(), window, "{interval} ms");
+            assert!(rate.suspect.is_none(), "{interval} ms: the episode ended");
+        }
+    }
+
+    #[test]
+    fn sustained_delay_is_still_congestion_when_frames_are_sparse() {
+        // Acknowledgements keep arriving, 400 ms late: the first one sets
+        // the boundary, and a frame sent after it that is late as well
+        // confirms. With frames this far apart that is one frame interval
+        // and one budget after the first late acknowledgement.
+        for (interval, by_ms) in [(167, 5_900), (100, 5_800), (33, 5_750)] {
+            let start = Instant::now();
+            let mut rate = AdaptiveBitrate::new(12_000_000, start);
+            rate.set_frame_rate_ceiling(60);
+            let mut path = Path::new(35);
+            path.interval = interval;
+            path.run(&mut rate, start, 0, 5_000);
+            path.slow = Some((5_000, 400));
+            path.run(&mut rate, start, 5_000, 5_400);
+            assert_eq!(
+                rate.current(),
+                12_000_000,
+                "{interval} ms: nothing acknowledged yet"
+            );
+            path.run(&mut rate, start, 5_400, by_ms);
+            assert_eq!(rate.current(), 7_300_000, "{interval} ms between frames");
+            path.run(&mut rate, start, by_ms, 12_000);
+            assert_eq!(
+                rate.current(),
+                1_000_000,
+                "{interval} ms: down to the floor"
+            );
+        }
+        // An outage with no acknowledgement at all is caught by the stall
+        // grace alone, sparse or not.
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.sent(0, at(0));
+        rate.acknowledged(0, 0, at(35));
+        rate.sent(1, at(2_000));
+        rate.check_stall(at(2_160));
+        rate.sent(2, at(2_167));
+        rate.check_stall(at(2_330));
+        assert_eq!(rate.current(), 12_000_000, "a frame sent into the silence");
+        rate.check_stall(at(2_501));
+        assert_eq!(rate.current(), 7_300_000, "budget plus stall grace");
+    }
+
+    #[test]
+    fn a_sound_pressure_cut_stays_urgent_until_the_encoder_adopts_it() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        let mut applier = RateApplier::new(Duration::from_secs(30));
+        assert_eq!(
+            applier.select(
+                rate.current(),
+                60,
+                true,
+                rate.audio_urgent(at(0)),
+                false,
+                at(0)
+            ),
+            12_000_000
+        );
+        applier.idr_sent(at(0));
+        assert!(!rate.audio_urgent(at(0)));
+        rate.audio_congested(at(1_000));
+        assert_eq!(rate.current(), 7_300_000);
+        // The screen is still. 3.5 s later the pressure itself has aged out,
+        // but the cut has not reached the encoder.
+        assert!(!rate.audio_pressure(at(4_500)) && rate.audio_urgent(at(4_500)));
+        // A refinement frame is held at the applied rate and consumes nothing.
+        let held = applier.select(rate.current(), 60, false, true, true, at(4_500));
+        assert_eq!(held, 12_000_000);
+        rate.rate_adopted(held);
+        assert!(rate.audio_urgent(at(4_500)));
+        // Neither a new sound backend nor a graphics reset undoes the cut.
+        rate.clear_audio_congestion();
+        rate.reset_frames();
+        assert_eq!(rate.current(), 7_300_000);
+        assert!(rate.audio_urgent(at(60_000)));
+        // The next changed frame, a minute later and with no payload to
+        // measure, is encoded at the reduced rate.
+        let urgent = rate.audio_urgent(at(60_000));
+        let adopted = applier.select(rate.current(), 60, false, urgent, false, at(60_000));
+        assert_eq!(adopted, 7_300_000);
+        rate.rate_adopted(adopted);
+        assert!(!rate.audio_urgent(at(60_000)), "delivered once");
+        // A cut made while the encoder is already at or below the target is
+        // settled by the next frame without a reconfiguration.
+        let mut rate = AdaptiveBitrate::new(1_000_000, start);
+        rate.audio_congested(at(1_000));
+        assert!(rate.audio_urgent(at(9_000)));
+        rate.rate_adopted(1_000_000);
+        assert!(!rate.audio_urgent(at(9_000)));
+        // A replacement controller inherits an undelivered cut with the
+        // pressure and the level.
+        let mut previous = AdaptiveBitrate::new(12_000_000, start);
+        previous.audio_congested(at(1_000));
+        let mut replacement = AdaptiveBitrate::new(12_000_000, at(1_100));
+        replacement.inherit_audio_congestion(&previous, at(1_100));
+        assert_eq!(replacement.current(), 7_300_000);
+        assert!(replacement.audio_urgent(at(60_000)));
+        // The applier reports the cadence a refinement frame must keep.
+        assert_eq!(applier.applied_fps(), Some(60));
+        assert_eq!(RateApplier::new(Duration::ZERO).applied_fps(), None);
+    }
+
     #[test]
     fn performance_settings_are_bounded_and_strict() {
         for maximum in [60, 100] {

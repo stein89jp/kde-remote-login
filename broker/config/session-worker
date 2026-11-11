@@ -86,6 +86,13 @@ mkdir -p "$overlay"
 printf '%s\n' '# Generated per remote session by /usr/lib/kde-rdp/session-worker.' \
     '[Plugins]' 'shakecursorEnabled[$i]=false' > "$overlay/kwinrc"
 export XDG_CONFIG_DIRS="$overlay:${XDG_CONFIG_DIRS:-/etc/xdg}"
+# The virtual output has no DDC/CI monitor behind it. Without this, powerdevil
+# probes the host's /dev/i2c-* buses with libddcutil at every login: for an
+# account outside the i2c group that is six permission-denied retries (about
+# three seconds) before its D-Bus services appear, and for an account inside
+# it a remote session would drive the brightness of the host's physical
+# monitors. Session-scoped: local logins keep DDC brightness control.
+export POWERDEVIL_NO_DDCUTIL=1
 export PIPEWIRE_RUNTIME_DIR="$KDE_RDP_RUNTIME_DIR"
 export PIPEWIRE_REMOTE=pipewire-0
 export PULSE_SERVER="unix:$KDE_RDP_RUNTIME_DIR/pulse/native"

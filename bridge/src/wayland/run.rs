@@ -8,7 +8,7 @@
 //! and the retained desktop is re-sent as a heartbeat once per second.
 //! Resizing renegotiates the stream size, which KWin's virtual output
 //! follows; output management is never used (docs/kde-findings.md section 4).
-use super::capture::{CapturePool, damage_tiles};
+use super::capture::{ShmCapture, damage_tiles};
 use super::cursor::{CursorPublisher, CursorTracker, CursorUpdate};
 use super::kwin_input::KwinInput;
 use super::protocols::screencast::{
@@ -74,6 +74,35 @@ pub(super) fn run(
 fn stream_size(target: DesktopSize) -> (u32, u32) {
     let clamp = |value: u16| u32::from(value).clamp(200, crate::MAX_DIMENSION);
     (clamp(target.width), clamp(target.height))
+}
+
+/// What the worker does with a taken frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameRoute {
+    /// A DMA-BUF the GPU encoder imports: GPU capture is in effect.
+    Gpu,
+    /// A DMA-BUF from before the switch to SHM: tiled, unreadable.
+    StaleDmaBuf,
+    /// MemFd pixels, copied into the SHM pool. These still arrive after a
+    /// DMA-BUF renegotiation is requested, until KWin's first DMA-BUF.
+    Shm,
+    Unmapped,
+}
+impl FrameRoute {
+    fn of(memory: &Memory, stream_dmabuf: bool) -> Self {
+        match memory {
+            Memory::DmaBuf(_) if stream_dmabuf => Self::Gpu,
+            Memory::DmaBuf(_) => Self::StaleDmaBuf,
+            Memory::Shm(_) => Self::Shm,
+            Memory::Unmapped => Self::Unmapped,
+        }
+    }
+    /// Whether this frame proves the SHM pool is no longer needed. Only an
+    /// accepted DMA-BUF does: SHM frames of the renegotiation window still
+    /// need the pool, and a stale DMA-BUF arrives when SHM is coming back.
+    fn releases_shm(self) -> bool {
+        self == Self::Gpu
+    }
 }
 
 /// How the event loop continues.
@@ -163,7 +192,7 @@ struct CaptureLoop {
     refresh_requested: bool,
     // Capture loop state.
     started: Instant,
-    shm: Option<CapturePool>,
+    shm: ShmCapture,
     gpu_sequence: u64,
     next_capture: Instant,
     frame_waiting: bool,
@@ -357,7 +386,7 @@ impl CaptureLoop {
             known_cursor: 0,
             refresh_requested: false,
             started: now,
-            shm: None,
+            shm: ShmCapture::default(),
             gpu_sequence: 0,
             next_capture: now,
             frame_waiting: true,
@@ -693,31 +722,32 @@ impl CaptureLoop {
             self.telemetry.count("capture_size_mismatch", 1);
         }
         let damage = frame.damage.clone();
-        let (image, owner, gpu) = match frame.memory {
-            Memory::DmaBuf(_) if self.stream_dmabuf => {
-                (self.gpu_ticket(frame, captured_at)?, None, true)
-            }
-            Memory::DmaBuf(_) => {
-                // A DMA-BUF from before the switch to SHM: tiled, unreadable.
+        let route = FrameRoute::of(&frame.memory, self.stream_dmabuf);
+        let (image, owner, gpu) = match route {
+            FrameRoute::Gpu => (self.gpu_ticket(frame, captured_at)?, None, true),
+            FrameRoute::StaleDmaBuf => {
                 self.telemetry.count("capture_dropped_dmabuf", 1);
                 self.damage_continuous = false;
                 return Ok(());
             }
-            Memory::Unmapped => anyhow::bail!("unmappable SHM screencast buffer"),
-            Memory::Shm(_) => {
+            FrameRoute::Unmapped => anyhow::bail!("unmappable SHM screencast buffer"),
+            FrameRoute::Shm => {
                 let pixels = frame
                     .pixels()
                     .ok_or_else(|| anyhow::anyhow!("invalid SHM screencast layout"))?;
                 let layout = (width, height, frame.stride);
-                if self.shm.as_ref().is_none_or(|pool| pool.layout != layout) {
-                    self.shm = Some(CapturePool::new(layout));
-                }
-                let (_, image, owner) = self.shm.as_mut().unwrap().capture(pixels, desktop)?;
+                let (_, image, owner) = self.shm.capture(layout, pixels, desktop)?;
                 // The copy is done: KWin gets its buffer back now.
                 drop(frame);
                 (image, owner, false)
             }
         };
+        // The encoder has its DMA-BUF ticket. Snapshots that still hold a
+        // slot keep it mapped until they drop; `latest`, the last SHM
+        // snapshot, is never comparable to a GPU token and is replaced below.
+        if route.releases_shm() && self.shm.release() {
+            self.telemetry.count("capture_shm_pool_releases", 1);
+        }
         let (changed, changes) = self.compare_with_latest(&image, gpu, damage.as_deref());
         self.damage_continuous = true;
         self.telemetry
@@ -861,7 +891,7 @@ impl CaptureLoop {
         if let Some(zkde) = self.zkde.take() {
             zkde.close();
         }
-        self.shm = None;
+        self.shm.release();
         // A successful flush only hands bytes to the socket. Await
         // wl_display.sync so KWin processes the releases before this client
         // socket closes; otherwise a hangup may discard final releases.
@@ -886,6 +916,65 @@ mod tests {
         assert_eq!(stream_size(size(1920, 1080)), (1920, 1080));
         assert_eq!(stream_size(size(100, 4096)), (200, 4096));
         assert_eq!(stream_size(size(1, 1)), (200, 200));
+    }
+    #[test]
+    fn only_an_accepted_dmabuf_releases_the_shm_pool() {
+        let shm = Memory::Shm(std::ptr::null());
+        // SHM frames still arrive between the DMA-BUF renegotiation request
+        // and KWin's first DMA-BUF; they keep using the pool.
+        for stream_dmabuf in [false, true] {
+            let route = FrameRoute::of(&shm, stream_dmabuf);
+            assert_eq!(route, FrameRoute::Shm);
+            assert!(!route.releases_shm());
+        }
+        let gpu = FrameRoute::of(&Memory::DmaBuf(-1), true);
+        assert_eq!(gpu, FrameRoute::Gpu);
+        assert!(gpu.releases_shm());
+        // A DMA-BUF after the switch back to SHM is dropped; SHM follows.
+        let stale = FrameRoute::of(&Memory::DmaBuf(-1), false);
+        assert_eq!(stale, FrameRoute::StaleDmaBuf);
+        assert!(!stale.releases_shm());
+        assert!(!FrameRoute::of(&Memory::Unmapped, true).releases_shm());
+    }
+    #[test]
+    fn shm_to_gpu_switch_releases_the_pool_once_and_shm_fallback_rebuilds_it() {
+        const SIZE: u32 = 64;
+        let layout = (SIZE, SIZE, SIZE * 4);
+        let desktop = DesktopSize {
+            width: SIZE as u16,
+            height: SIZE as u16,
+        };
+        let pixels = vec![7u8; (SIZE * SIZE * 4) as usize];
+        let mut shm = ShmCapture::default();
+        // The same sequence publish() follows: an SHM session, the
+        // renegotiation window, GPU frames, then a fallback to SHM.
+        let mut releases = 0;
+        let mut latest = None;
+        for (memory, stream_dmabuf) in [
+            (Memory::Shm(pixels.as_ptr()), false),
+            (Memory::Shm(pixels.as_ptr()), true),
+            (Memory::DmaBuf(-1), true),
+            (Memory::DmaBuf(-1), true),
+            (Memory::DmaBuf(-1), false),
+            (Memory::Shm(pixels.as_ptr()), false),
+        ] {
+            let route = FrameRoute::of(&memory, stream_dmabuf);
+            if route == FrameRoute::Shm {
+                latest = Some(shm.capture(layout, &pixels, desktop).unwrap().1);
+            }
+            if route.releases_shm() && shm.release() {
+                releases += 1;
+                // The worker's latest SHM snapshot is still readable.
+                assert!(latest.as_ref().unwrap().data.iter().all(|byte| *byte == 7));
+                latest = None;
+            }
+        }
+        assert_eq!(releases, 1, "later GPU frames find no pool to release");
+        assert!(
+            latest.is_some(),
+            "the SHM fallback captured into a new pool"
+        );
+        assert!(shm.release());
     }
     #[test]
     fn cursor_mode_follows_client_pointer_support() {

@@ -250,6 +250,11 @@ picture. The worker writes `[Plugins] shakecursorEnabled[$i]=false` to a
 `XDG_CONFIG_DIRS`; `~/.config/kwinrc` is not modified, and the effect appears
 locked in System Settings only while you are connected remotely.
 
+Remote sessions also run with `POWERDEVIL_NO_DDCUTIL=1`: Plasma's power
+management does not probe or control the host's physical monitors over DDC/CI
+from the virtual output, so monitor brightness sliders for those monitors are
+absent while you are connected remotely. Local logins are unaffected.
+
 The remote session uses its own Wayland socket and D-Bus bus. Local systemd desktop
 services are not started or given the remote environment: `session-plasma`
 starts Plasma with `plasma_session` (Plasma's own non-systemd session manager,
@@ -620,16 +625,26 @@ permissions and end-to-end throughput still need the
 second (default 60 for NVENC, 30 for bitmap). `KDE_RDP_BITRATE_MBPS` accepts
 1–100 megabits per second (default 12) as the NVENC bitrate ceiling. Each
 connection starts at that ceiling and steps down through six quantized levels
-toward 1 Mbps when graphics acknowledgements slow relative to the connection's
-baseline, stall, or report a client decoding backlog, at most one level per
-second. Audio receipt or playback congestion also reduces the video target,
-including while graphics acknowledgements are suspended. It rises one level
-after 10 seconds of healthy delivery without audio congestion, applied at the
-next due keyframe or within 30 seconds.
-Changes apply to the live encoder without resetting the desktop. Reduce the
-frame rate or ceiling for limited networks; increasing the ceiling can improve
-AVC420 quality when the connection has enough bandwidth. Bitmap fallback does
-not use this bitrate controller.
+toward 1 Mbps when graphics acknowledgements stay slow relative to the
+connection's baseline, stall, or report a client decoding backlog, at most one
+level per second. One delayed flight of frames (a brief link stall) is
+tolerated; delay counts as congestion when a frame sent afterwards is late as
+well, when such episodes follow within half a second, or when a frame stays
+unacknowledged for about half a second. Audio receipt or playback congestion
+also reduces the video target at once, including while graphics
+acknowledgements are suspended. The level rises one step after 10 seconds of
+healthy delivery without audio congestion.
+Reconfiguring the live encoder costs a keyframe, so a new level reaches it only
+when that changes what is sent: a lower level once the last second of video
+exceeded it (or at once after audio congestion), a higher level once 30 seconds
+have passed since the last keyframe and the encoder is using at least three
+quarters of its current rate, and any level for free when a keyframe is due
+anyway. The desktop is never reset. `KDE_RDP_MIN_QP` (1-51, default 18) is the
+encoder's quantiser floor: it stops spending bitrate on detail below visible
+quality, and 1 disables it. Reduce the frame rate or ceiling for limited
+networks; increasing the ceiling can improve AVC420 quality when the connection
+has enough bandwidth. Bitmap fallback does not use this bitrate controller.
+See [performance.md](performance.md) for the details and measurements.
 
 Audio prefers stereo 44.1 kHz PCM at about 1.41 Mbps, resampled from the
 48 kHz capture, then stereo 48 kHz PCM at about 1.54 Mbps (mono PCM is opt-in).
@@ -680,8 +695,9 @@ The current combined package includes NVENC; the archived
 NVENC uses supported DMA-BUF capture by default (`KDE_RDP_GPU_CAPTURE=auto`):
 EGL conversion and CUDA/NVENC surfaces, with SHM fallback. Set `shm` to force
 CPU readback and full-range BT.709 conversion; bitmap mode always uses SHM.
-Periodic keyframes are a 30-second safety net (`KDE_RDP_GOP_SECONDS`, 1–3600);
-refresh, resize, resume and frame drops still force keyframes immediately.
+There is effectively no periodic keyframe (`KDE_RDP_GOP_SECONDS`, 1–3600,
+default 3600); refresh, resize, resume and frame drops still force keyframes
+immediately.
 See [device requirements and measurements](performance.md); GPU compositing
 alone does not prove that capture stays on the GPU.
 

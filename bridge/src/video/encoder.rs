@@ -19,6 +19,7 @@ unsafe extern "C" {
         spatial_aq: c_int,
         avc444: c_int,
         gop_seconds: c_int,
+        min_qp: c_int,
         error: *mut c_char,
         length: usize,
     ) -> *mut c_void;
@@ -52,6 +53,7 @@ unsafe extern "C" {
         length: usize,
     ) -> c_int;
     fn niri_video_timings(encoder: *mut c_void, convert_ms: *mut f64, encode_ms: *mut f64);
+    fn niri_video_quantizer(encoder: *mut c_void) -> c_int;
     #[cfg(test)]
     fn niri_video_set_bitrate(encoder: *mut c_void, bitrate: c_int) -> c_int;
     fn niri_video_encode(
@@ -101,10 +103,19 @@ pub(super) struct EncodedFrame {
     pub(super) main: Vec<u8>,
     pub(super) idr: bool,
     pub(super) auxiliary: Option<Vec<u8>>,
+    /// Average quantiser of the frame (the higher of two AVC444 views), when
+    /// the encoder reports it.
+    pub(super) qp: Option<u8>,
     pub(super) conversion: Duration,
     pub(super) encode: Duration,
     pub(super) captured_at: Option<Instant>,
     pub(super) received_at: Instant,
+}
+impl EncodedFrame {
+    /// H.264 bytes of the main and auxiliary views.
+    pub(super) fn payload(&self) -> usize {
+        self.main.len() + self.auxiliary.as_ref().map_or(0, Vec::len)
+    }
 }
 impl From<Vec<u8>> for EncodedFrame {
     fn from(main: Vec<u8>) -> Self {
@@ -112,6 +123,7 @@ impl From<Vec<u8>> for EncodedFrame {
             idr: h264_has_idr(&main),
             main,
             auxiliary: None,
+            qp: None,
             conversion: Duration::ZERO,
             encode: Duration::ZERO,
             captured_at: None,
@@ -277,6 +289,7 @@ impl Encoder {
                 config.spatial_aq.into(),
                 avc444.into(),
                 config.gop_seconds as c_int,
+                config.min_qp as c_int,
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -299,6 +312,9 @@ impl Encoder {
             gpu_active: false,
             config: *config,
         })
+    }
+    fn quantizer(&self) -> Option<u8> {
+        u8::try_from(unsafe { niri_video_quantizer(self.ptr) }).ok()
     }
     fn timings(&self) -> (Duration, Duration) {
         let (mut conversion, mut encode) = (0.0, 0.0);
@@ -329,6 +345,7 @@ impl Encoder {
             } else {
                 None
             },
+            qp: self.quantizer(),
             conversion,
             encode,
             captured_at: None,
@@ -347,6 +364,7 @@ impl Encoder {
                 idr: h264_has_idr(&main),
                 main,
                 auxiliary: None,
+                qp: self.quantizer(),
                 conversion,
                 encode,
                 captured_at: None,

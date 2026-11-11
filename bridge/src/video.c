@@ -6,6 +6,7 @@
 #include <libavutil/opt.h>
 #include <libavutil/mem.h>
 #include <libavutil/cpu.h>
+#include <libavutil/intreadwrite.h>
 #include <libswscale/swscale.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,9 +19,16 @@ static void video_gpu_free(struct niri_gpu *gpu);
 
 /* RDPGFX is reliable TCP and every recovery point (refresh, resume, dropped
    frame, resize, caps change, rate change) already forces an IDR. A periodic
-   IDR is therefore only a rare safety net, not a loss-recovery mechanism. */
-#define NIRI_VIDEO_DEFAULT_GOP_SECONDS 30
+   IDR recovers nothing, and on a settled page each one costs a visibly soft
+   picture until the encoder has refined it again, so the default is the
+   longest interval: an hour of continuously encoded frames. */
+#define NIRI_VIDEO_DEFAULT_GOP_SECONDS 3600
 #define NIRI_VIDEO_MAX_GOP_SECONDS 3600
+/* Without a quantiser floor the encoder keeps lowering QP on easy content and
+   spends most of its bitrate on differences nobody can see: a 1080p photo pan
+   measured 5.8 Mbit/s unfloored and 1.05 Mbit/s at 18, 1.3 dB apart. */
+#define NIRI_VIDEO_DEFAULT_MIN_QP 18
+#define NIRI_VIDEO_MAX_QP 51
 
 struct niri_video {
     AVCodecContext *codec;
@@ -40,6 +48,9 @@ struct niri_video {
     double convert_ms, encode_ms;
     int preset, spatial_aq;
     int fps, gop_seconds;
+    int min_qp;
+    /* Highest average QP among the views of the last encoded frame, or -1. */
+    int quantizer;
     struct niri_gpu *gpu;
 };
 
@@ -142,19 +153,23 @@ static void nvenc_configure(const struct niri_video *v, AVCodecContext *c, int b
     av_dict_set(options, "spatial-aq", v->spatial_aq ? "1" : "0", 0);
     av_dict_set(options, "aq-strength", "8", 0);
     if (v->avc444) av_dict_set(options, "dpb_size", "2", 0);
+    /* The wrapper's own option sets NVENC's minimum QP for I, P and B frames
+       without the warning it logs for the generic field, which older
+       wrappers read instead. */
+    if (av_opt_set_int(c->priv_data, "qmin", v->min_qp, 0) < 0) c->qmin = v->min_qp;
 }
 
 /* software is used by regression tests only; production always requests NVENC. */
 struct niri_video *niri_video_new_encoder(int width, int height, int software, int fps, int bitrate,
                                          int preset, int spatial_aq, int avc444, int gop_seconds,
-                                         char *error, size_t length) {
+                                         int min_qp, char *error, size_t length) {
     if (length) error[0] = '\0';
     if (width < 1 || height < 1 || width > 4096 || height > 4096 ||
         fps < 1 || fps > 60 || bitrate < 1000000 || bitrate > 100000000 ||
         preset < 1 || preset > 7 || (spatial_aq != 0 && spatial_aq != 1) ||
         (avc444 != 0 && avc444 != 1) || gop_seconds < 1 ||
-        gop_seconds > NIRI_VIDEO_MAX_GOP_SECONDS) {
-        snprintf(error, length, "invalid H.264 dimensions, framerate, bitrate or GOP");
+        gop_seconds > NIRI_VIDEO_MAX_GOP_SECONDS || min_qp < 1 || min_qp > NIRI_VIDEO_MAX_QP) {
+        snprintf(error, length, "invalid H.264 dimensions, framerate, bitrate, GOP or minimum QP");
         return NULL;
     }
     const AVCodec *codec = avcodec_find_encoder_by_name(software ? "libx264" : "h264_nvenc");
@@ -182,12 +197,15 @@ struct niri_video *niri_video_new_encoder(int width, int height, int software, i
     v->spatial_aq = spatial_aq;
     v->fps = fps;
     v->gop_seconds = gop_seconds;
+    v->min_qp = min_qp;
+    v->quantizer = -1;
     /* NVENC's packed RGB conversion is fixed to limited-range BT.601.
        RDP AVC420 requires full-range BT.709, so convert explicitly first. */
     c->pix_fmt = software ? AV_PIX_FMT_YUV420P : AV_PIX_FMT_NV12;
     AVDictionary *options = NULL;
     if (software) {
         video_configure_codec(v, c, bitrate);
+        c->qmin = min_qp;
         av_dict_set(&options, "preset", "ultrafast", 0);
         av_dict_set(&options, "tune", "zerolatency", 0);
         av_dict_set(&options, "profile", "high", 0);
@@ -198,6 +216,10 @@ struct niri_video *niri_video_new_encoder(int width, int height, int software, i
     av_dict_free(&options);
     if (result < 0) {
         error_text(error, length, "open H.264 encoder", result);
+        goto fail;
+    }
+    if (c->qmin != min_qp) {
+        snprintf(error, length, "H.264 encoder ignored the minimum QP");
         goto fail;
     }
     v->frame->format = c->pix_fmt;
@@ -328,12 +350,14 @@ fail:
     return NULL;
 }
 
-/* Stable entry points for fixtures and benchmarks using the default GOP. */
+/* Stable entry points for fixtures and benchmarks using the default GOP and
+   quantiser floor. */
 struct niri_video *niri_video_new_config(int width, int height, int software, int fps, int bitrate,
                                         int preset, int spatial_aq, int avc444,
                                         char *error, size_t length) {
     return niri_video_new_encoder(width, height, software, fps, bitrate, preset, spatial_aq,
-                                  avc444, NIRI_VIDEO_DEFAULT_GOP_SECONDS, error, length);
+                                  avc444, NIRI_VIDEO_DEFAULT_GOP_SECONDS,
+                                  NIRI_VIDEO_DEFAULT_MIN_QP, error, length);
 }
 
 struct niri_video *niri_video_new(int width, int height, int software, int fps, int bitrate,
@@ -397,6 +421,15 @@ static int encode_view(struct niri_video *v, AVFrame *frame, int force_idr,
     result = avcodec_receive_packet(v->codec, v->packet);
     v->encode_ms += video_now_ms() - start;
     if (result < 0) goto fail;
+    /* Both wrappers attach the frame's average QP; NVENC's stores it less one. */
+    size_t stats_size = 0;
+    const uint8_t *stats = av_packet_get_side_data(v->packet, AV_PKT_DATA_QUALITY_STATS,
+                                                   &stats_size);
+    if (stats && stats_size >= 4) {
+        int qp = (int)(AV_RL32(stats) / FF_QP2LAMBDA) +
+                 (strcmp(v->codec->codec->name, "h264_nvenc") ? 0 : 1);
+        if (qp > v->quantizer) v->quantizer = qp;
+    }
     *data = v->packet->data;
     return v->packet->size;
 fail:
@@ -417,6 +450,7 @@ int niri_video_encode_pair(struct niri_video *v, const uint8_t *pixels, int stri
     }
     double start = video_now_ms();
     v->encode_ms = 0;
+    v->quantizer = -1;
     int result = av_frame_make_writable(v->rgb);
     if (result >= 0) result = av_frame_make_writable(v->full_chroma);
     if (result >= 0) result = av_frame_make_writable(v->frame);
@@ -458,6 +492,13 @@ void niri_video_timings(const struct niri_video *v, double *conversion_ms, doubl
     *conversion_ms = v ? v->convert_ms : 0; *encode_ms = v ? v->encode_ms : 0;
 }
 
+/* Average QP of the last encoded frame (the higher of two AVC444 views), or
+   -1 when the encoder reported none. At the floor with frames no longer
+   shrinking, a still image has nothing left to refine. */
+int niri_video_quantizer(const struct niri_video *v) {
+    return v ? v->quantizer : -1;
+}
+
 /* Returned packet memory remains owned by v until the next call or free. */
 int niri_video_encode(struct niri_video *v, const uint8_t *pixels, int stride,
                       int force_idr, const uint8_t **data, char *error, size_t length) {
@@ -470,6 +511,7 @@ int niri_video_encode(struct niri_video *v, const uint8_t *pixels, int stride,
     }
     double start = video_now_ms();
     v->encode_ms = 0;
+    v->quantizer = -1;
     int result = av_frame_make_writable(v->frame);
     if (result < 0) goto fail;
 #if LIBSWSCALE_VERSION_MAJOR >= 6
